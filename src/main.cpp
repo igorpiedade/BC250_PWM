@@ -61,6 +61,7 @@ static const char* WIFI_FALLBACK_AP_SSID = "SteamMachine";
 static const char* WIFI_PREF_NAMESPACE = "wifi";
 static const char* WIFI_PREF_KEY_SSID = "ssid";
 static const char* WIFI_PREF_KEY_PASS = "pass";
+static const uint8_t WIFI_MAX_CONNECT_ATTEMPTS = 3;
 static const char* WIFI_PREF_KEY_AUTH_HASH = "auth_hash";
 static const char* WIFI_PREF_KEY_AUTH_FORCE = "auth_force";
 static const char* WIFI_PREF_KEY_LED_BOOT = "led_boot";
@@ -103,6 +104,8 @@ DNSServer dnsServer;
 String savedWifiSsid;
 String savedWifiPass;
 unsigned long wifiConnectStartedAt = 0;
+uint8_t wifiConnectAttempts = 0;
+bool wifiAttemptLimitLogged = false;
 bool wifiFallbackApEnabled = false;
 bool wifiWasConnected = false;
 bool webServerStarted = false;
@@ -150,6 +153,30 @@ void beginWifiConnection(const String& ssid, const String& pass) {
 
   Serial.print("[WIFI] Connecting to ");
   Serial.println(ssid);
+}
+
+bool trySavedWifiConnection() {
+  if (savedWifiSsid.length() == 0) {
+    return false;
+  }
+
+  if (wifiConnectAttempts >= WIFI_MAX_CONNECT_ATTEMPTS) {
+    if (!wifiAttemptLimitLogged) {
+      Serial.print("[WIFI] Reached max connect attempts (");
+      Serial.print(WIFI_MAX_CONNECT_ATTEMPTS);
+      Serial.println("). Stopping retries.");
+      wifiAttemptLimitLogged = true;
+    }
+    return false;
+  }
+
+  ++wifiConnectAttempts;
+  Serial.print("[WIFI] Connect attempt ");
+  Serial.print(wifiConnectAttempts);
+  Serial.print("/");
+  Serial.println(WIFI_MAX_CONNECT_ATTEMPTS);
+  beginWifiConnection(savedWifiSsid, savedWifiPass);
+  return true;
 }
 
 String htmlEscape(const String& value) {
@@ -1243,8 +1270,12 @@ void handleConnect() {
   preferences.putString(WIFI_PREF_KEY_SSID, savedWifiSsid);
   preferences.putString(WIFI_PREF_KEY_PASS, savedWifiPass);
 
+  wifiConnectAttempts = 0;
+  wifiAttemptLimitLogged = false;
+
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(savedWifiSsid.c_str(), savedWifiPass.c_str());
+  wifiConnectAttempts = 1;
   wifiConnectStartedAt = millis();
 
   String html;
@@ -1387,7 +1418,7 @@ void setupWifiWebUi() {
   });
 
   if (savedWifiSsid.length() > 0) {
-    beginWifiConnection(savedWifiSsid, savedWifiPass);
+    trySavedWifiConnection();
   } else {
     WiFi.mode(WIFI_STA);
     Serial.println("[WIFI] No saved credentials; fallback AP is OFF until manual 15s hold");
@@ -1405,21 +1436,23 @@ void updateWifiState() {
   if (connected && !wifiWasConnected) {
     Serial.print("[WIFI] Connected, IP: ");
     Serial.println(WiFi.localIP());
+    wifiConnectAttempts = 0;
+    wifiAttemptLimitLogged = false;
     disableFallbackAp();
   }
 
   if (!connected && wifiWasConnected) {
     Serial.println("[WIFI] Connection lost");
-    if (savedWifiSsid.length() > 0) {
-      beginWifiConnection(savedWifiSsid, savedWifiPass);
-    }
+    trySavedWifiConnection();
   }
 
   bool timedOut = savedWifiSsid.length() > 0 &&
                   (millis() - wifiConnectStartedAt) >= WIFI_CONNECT_TIMEOUT_MS;
   if (!connected && timedOut) {
-    Serial.println("[WIFI] Connect timeout, retrying saved credentials");
-    beginWifiConnection(savedWifiSsid, savedWifiPass);
+    if (wifiConnectAttempts < WIFI_MAX_CONNECT_ATTEMPTS) {
+      Serial.println("[WIFI] Connect timeout, retrying saved credentials");
+    }
+    trySavedWifiConnection();
   }
 
   if (wifiFallbackApEnabled && fallbackApExpiresAt != 0) {
