@@ -3,6 +3,7 @@
 #include <DNSServer.h>
 #include <mbedtls/sha256.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
 // ESP32 Power Controller for ASRock BC250 + FlexATX PSU
@@ -31,6 +32,7 @@ static const int PIN_TRANSISTOR_DRIVE = 25; // Output to 2N2222 base (through pr
 static const int PIN_BUTTON_START = 18;     // Start button input
 static const int PIN_MB_STATUS = 34;        // Input from BC250: signal present = board ON
 static const int PIN_ARGB_DATA = 23;        // ARGB data output
+static const int PIN_BOARD_LED = 2;         // ESP32 Dev Module onboard LED
 static const uint16_t ARGB_LED_COUNT = 1;
 
 // ------------------------------
@@ -113,6 +115,10 @@ String authPasswordHash;
 bool authForcePasswordChange = true;
 String authSessionId;
 String connectedUiNotice;
+bool firmwareUploadAuthorized = false;
+bool firmwareUploadStarted = false;
+bool firmwareUploadComplete = false;
+String firmwareUploadError;
 
 struct RgbColor {
   uint8_t r;
@@ -775,6 +781,90 @@ void handleLedColorUpdate() {
   sendRedirect("/");
 }
 
+void handleFirmwareUpload() {
+  HTTPUpload& upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    firmwareUploadAuthorized = isConnectedModeWebUi() && isAuthenticated() && !authForcePasswordChange;
+    firmwareUploadStarted = false;
+    firmwareUploadComplete = false;
+    firmwareUploadError = "";
+
+    if (!firmwareUploadAuthorized) {
+      firmwareUploadError = "Authentication required.";
+      return;
+    }
+    if (powerEnabled) {
+      firmwareUploadError = "Turn the power output off before updating firmware.";
+      return;
+    }
+
+    String filename = upload.filename;
+    filename.toLowerCase();
+    if (!filename.endsWith(".bin")) {
+      firmwareUploadError = "Select a compiled .bin firmware file.";
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      firmwareUploadError = Update.errorString();
+      return;
+    }
+    firmwareUploadStarted = true;
+    return;
+  }
+
+  if (!firmwareUploadStarted) {
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      firmwareUploadError = Update.errorString();
+      Update.abort();
+      firmwareUploadStarted = false;
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    firmwareUploadComplete = Update.end(true);
+    if (!firmwareUploadComplete) {
+      firmwareUploadError = Update.errorString();
+    }
+    firmwareUploadStarted = false;
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    firmwareUploadStarted = false;
+    firmwareUploadError = "Firmware upload was interrupted.";
+  }
+}
+
+void handleFirmwareUpdate() {
+  if (!isConnectedModeWebUi()) {
+    sendRedirect("/");
+    return;
+  }
+  if (!isAuthenticated()) {
+    sendRedirect("/login");
+    return;
+  }
+  if (authForcePasswordChange) {
+    sendRedirect("/change-password");
+    return;
+  }
+
+  if (!firmwareUploadAuthorized) {
+    connectedUiNotice = firmwareUploadError.length() > 0 ? firmwareUploadError : "No firmware file was received.";
+    sendRedirect("/");
+    return;
+  }
+  if (!firmwareUploadComplete) {
+    connectedUiNotice = "Firmware update failed: " + firmwareUploadError;
+    sendRedirect("/");
+    return;
+  }
+
+  webServer.send(200, "text/html", "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Firmware update</title></head><body><p>Firmware updated. The board is restarting.</p></body></html>");
+  delay(1000);
+  ESP.restart();
+}
+
 void handleRoot() {
   if (isConnectedModeWebUi()) {
     if (requireAuthForConnectedUi()) {
@@ -827,20 +917,23 @@ void handleRoot() {
     html += ".power-actions form{flex:1;}";
     html += ".power-actions .btn{width:100%;}";
     html += ".led-list{margin-top:10px;display:grid;gap:10px;}";
-    html += ".led-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);}";
+    html += ".led-row{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);}";
     html += ".led-name{font-size:13px;color:#dce8ff;font-weight:700;}";
     html += ".led-preview{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:#dce8ff;}";
     html += ".swatch{width:14px;height:14px;border-radius:50%;border:1px solid rgba(255,255,255,.5);display:inline-block;}";
-    html += ".led-form{display:flex;gap:8px;align-items:center;}";
+    html += ".led-form{display:grid;grid-template-columns:42px minmax(0,1fr) 84px;gap:8px;align-items:center;width:100%;min-width:0;}";
     html += ".led-form input[type='color']{width:42px;height:32px;padding:0;border:none;background:transparent;cursor:pointer;}";
-    html += ".led-form .btn{padding:8px 10px;font-size:12px;}";
-    html += ".slider-wrap{display:grid;gap:6px;margin-top:8px;margin-bottom:10px;}";
+    html += ".led-form .btn{grid-column:3;grid-row:2;justify-self:end;width:84px;padding:8px;font-size:12px;}";
+    html += ".led-form .check-wrap{grid-column:1 / 3;grid-row:2;}";
+    html += ".slider-wrap{display:grid;gap:6px;min-width:0;margin:0;}";
     html += ".slider-label{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#dce8ff;font-weight:700;}";
     html += ".slider-value{font-size:12px;color:#dce8ff;}";
-    html += "input[type='range']{width:100%;accent-color:#3c8ef4;}";
-    html += ".check-wrap{display:flex;align-items:center;gap:8px;margin-bottom:10px;color:#dce8ff;font-size:13px;}";
+    html += "input[type='range']{width:100%;min-width:0;accent-color:#3c8ef4;}";
+    html += ".check-wrap{display:flex;align-items:center;gap:8px;margin:0;color:#dce8ff;font-size:13px;}";
     html += ".check-wrap input{width:16px;height:16px;}";
     html += ".led-full{width:100%;}";
+    html += ".firmware-form{display:grid;gap:10px;margin-top:12px;}";
+    html += ".firmware-form input[type='file']{width:100%;padding:10px;border:1px solid rgba(255,255,255,.24);border-radius:8px;background:#101733;color:#dce8ff;}";
     html += "@media (max-width:680px){";
     html += ".section-grid{grid-template-columns:1fr;}";
     html += ".title{font-size:34px;}";
@@ -907,6 +1000,11 @@ void handleRoot() {
     html += "><span>Effect (breathing)</span></label><button class='btn led-full' type='submit'>SAVE</button></form></div>";
     html += "</div></article>";
     html += "</section>";
+    html += "<section class='panel panel-main'><h2 class='section-title'>Firmware Update</h2>";
+    html += "<p class='section-copy'>Upload a compiled ESP32 .bin firmware file. The power output must be off. The board restarts after a successful update.</p>";
+    html += "<form class='firmware-form' method='POST' action='/update' enctype='multipart/form-data'>";
+    html += "<input type='file' name='firmware' accept='.bin,application/octet-stream' required>";
+    html += "<button class='btn' type='submit'>UPLOAD FIRMWARE</button></form></section>";
     html += "<section class='panel panel-main'>";
     html += "<p class='line'>Connected mode active.</p>";
     html += "<p id='wifiStatusLine' class='line'>" + htmlEscape(wifiModeLabel()) + "</p>";
@@ -1270,6 +1368,7 @@ void setupWifiWebUi() {
   webServer.on("/connect", HTTP_POST, handleConnect);
   webServer.on("/power-toggle", HTTP_POST, handlePowerToggle);
   webServer.on("/led-color", HTTP_POST, handleLedColorUpdate);
+  webServer.on("/update", HTTP_POST, handleFirmwareUpdate, handleFirmwareUpload);
   webServer.on("/connected-status", HTTP_GET, handleConnectedStatus);
   webServer.on("/login", HTTP_GET, handleLoginPage);
   webServer.on("/login", HTTP_POST, handleLoginSubmit);
@@ -1459,6 +1558,12 @@ void renderArgb() {
   );
 }
 
+void updateFallbackHoldIndicator() {
+  bool holdInProgress = !powerEnabled && offButtonPressTracking && !offButtonLongHoldHandled &&
+                        stableButton == BUTTON_ACTIVE_LEVEL && !wifiFallbackApEnabled;
+  digitalWrite(PIN_BOARD_LED, holdInProgress && (millis() / 500) % 2 == 0 ? HIGH : LOW);
+}
+
 void updateButtonState() {
   int raw = digitalRead(PIN_BUTTON_START);
 
@@ -1532,6 +1637,8 @@ void setup() {
 
   pinMode(PIN_TRANSISTOR_DRIVE, OUTPUT);
   digitalWrite(PIN_TRANSISTOR_DRIVE, LOW);
+  pinMode(PIN_BOARD_LED, OUTPUT);
+  digitalWrite(PIN_BOARD_LED, LOW);
 
   pinMode(PIN_BUTTON_START, INPUT_PULLUP);
 
@@ -1657,6 +1764,7 @@ void loop() {
 
   updateArgbStateMachine();
   reportArgbStateIfChanged();
+  updateFallbackHoldIndicator();
   renderArgb();
   updateWifiState();
 
