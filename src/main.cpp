@@ -79,6 +79,8 @@ static const char* WIFI_PREF_KEY_LED_NORMAL_BREATH = "led_norm_b";
 static const char* WIFI_PREF_KEY_LED_SHUTDOWN_BREATH = "led_shut_b";
 static const char* WIFI_PREF_KEY_API_KEY = "api_key";
 static const char* WIFI_PREF_KEY_OS_IP = "os_ip";
+static const char* WIFI_PREF_KEY_OS_IP_TS = "os_ip_ts";
+static const unsigned long OS_IP_MAX_AGE_MS = 24UL * 60UL * 60UL * 1000UL;
 static const uint8_t API_KEY_LENGTH = 20;
 static const char* AUTH_DEFAULT_USERNAME = "admin";
 static const char* AUTH_DEFAULT_PASSWORD = "admin250";
@@ -124,6 +126,9 @@ bool authForcePasswordChange = true;
 String authSessionId;
 String apiKey;
 String osIpAddress;
+unsigned long osIpAddressUpdatedAt = 0;
+bool osEndpointReachable = false;
+unsigned long osEndpointLastCheckedAt = 0;
 String connectedUiNotice;
 bool firmwareUploadAuthorized = false;
 bool firmwareUploadStarted = false;
@@ -219,6 +224,83 @@ void removeCustomState(uint8_t index) {
 
 bool isMainboardSignalPresent() {
   return digitalRead(PIN_MB_STATUS) == MB_SIGNAL_PRESENT_LEVEL;
+}
+
+bool isOsIpAddressFresh() {
+  if (osIpAddress.length() == 0 || osIpAddressUpdatedAt == 0) {
+    return false;
+  }
+  return (millis() - osIpAddressUpdatedAt) <= OS_IP_MAX_AGE_MS;
+}
+
+bool refreshOsEndpointReachability() {
+  if (!isMainboardSignalPresent()) {
+    osEndpointReachable = false;
+    return false;
+  }
+
+  if (osIpAddress.length() == 0 || !isOsIpAddressFresh()) {
+    osEndpointReachable = false;
+    return false;
+  }
+
+  unsigned long now = millis();
+  if (osEndpointLastCheckedAt != 0 && (now - osEndpointLastCheckedAt) < (5UL * 60UL * 1000UL)) {
+    return osEndpointReachable;
+  }
+  osEndpointLastCheckedAt = now;
+
+  WiFiClient client;
+  const uint32_t connectTimeoutMs = 1000;
+  const uint32_t responseTimeoutMs = 1500;
+
+  unsigned long connectStart = millis();
+  while (millis() - connectStart < connectTimeoutMs) {
+    if (client.connect(osIpAddress.c_str(), 8765)) {
+      break;
+    }
+    delay(20);
+  }
+
+  if (!client.connected()) {
+    osEndpointReachable = false;
+    client.stop();
+    return false;
+  }
+
+  client.setTimeout(1000);
+  client.print(F("GET /autodiscover HTTP/1.1\r\n"));
+  client.print(F("Host: "));
+  client.print(osIpAddress);
+  client.print(F("\r\n"));
+  client.print(F("Connection: close\r\n\r\n"));
+
+  unsigned long start = millis();
+  String response;
+  response.reserve(256);
+  while (millis() - start < responseTimeoutMs) {
+    while (client.available()) {
+      char c = static_cast<char>(client.read());
+      response += c;
+      if (response.length() >= 512) {
+        break;
+      }
+    }
+
+    if (response.length() > 0) {
+      break;
+    }
+    delay(10);
+  }
+
+  client.stop();
+
+  bool httpOk = response.indexOf("HTTP/1.1 200") >= 0 || response.indexOf("HTTP/1.0 200") >= 0;
+  bool statusOk = response.indexOf("\"status\":\"ok\"") >= 0 || response.indexOf("\"status\": \"ok\"") >= 0 ||
+                  response.indexOf("\"status\":\"OK\"") >= 0 || response.indexOf("\"status\": \"OK\"") >= 0;
+
+  osEndpointReachable = httpOk && statusOk;
+  return osEndpointReachable;
 }
 
 void beginWifiConnection(const String& ssid, const String& pass) {
@@ -803,6 +885,17 @@ void handleConnectedStatus() {
   }
   String ledBootColor = colorToHex(ledColorBooting);
   String ledStandbyColor = colorToHex(ledColorStandby);
+  bool isBoardOn = isMainboardSignalPresent();
+  bool osConnected = false;
+  String osStatusText = "Offline";
+  if (!isBoardOn) {
+    osStatusText = "Powered off";
+  } else if (osIpAddress.length() > 0 && isOsIpAddressFresh()) {
+    osConnected = refreshOsEndpointReachability();
+    osStatusText = osConnected ? "Connected" : "Unavailable";
+  } else {
+    osStatusText = "No OS IP";
+  }
 
   String json = "{";
   json += "\"mainBoardSignal\":";
@@ -817,6 +910,9 @@ void handleConnectedStatus() {
   json += ",\"wifiStatus\":\"" + jsonEscape(wifiStatus) + "\"";
   json += ",\"bluetoothStatus\":\"" + jsonEscape(bluetoothStatus) + "\"";
   json += ",\"apiStatus\":\"" + jsonEscape(apiStatus) + "\"";
+  json += ",\"osConnected\":" + String(osConnected ? "true" : "false");
+  json += ",\"osIpAddress\":\"" + jsonEscape(osIpAddress.length() > 0 && isOsIpAddressFresh() ? osIpAddress : "") + "\"";
+  json += ",\"osStatusText\":\"" + jsonEscape(osStatusText) + "\"";
   json += ",\"ledStatus\":\"" + jsonEscape(ledStatus) + "\"";
   json += ",\"ledBootColor\":\"" + ledBootColor + "\"";
   json += ",\"ledStandbyColor\":\"" + ledStandbyColor + "\"";
@@ -924,7 +1020,9 @@ void handleApiSetOsAddress() {
   }
 
   osIpAddress = parsed.toString();
+  osIpAddressUpdatedAt = millis();
   preferences.putString(WIFI_PREF_KEY_OS_IP, osIpAddress);
+  preferences.putULong(WIFI_PREF_KEY_OS_IP_TS, osIpAddressUpdatedAt);
 
   sendApiJson(200, "{\"success\":true,\"osAddress\":\"" + osIpAddress + "\"}");
 }
@@ -1490,6 +1588,14 @@ void handleRoot() {
     html += "<strong id='powerText'>";
     html += powerEnabled ? "ON" : "OFF";
     html += "</strong></span></div>";
+    html += "<div class='indicator-row'><span id='osIpDot' class='dot ";
+    html += isMainboardSignalPresent() && osEndpointReachable ? "dot-green" : "dot-red";
+    html += "'></span><span>OS IP: ";
+    html += "<strong id='osIpText'>";
+    if (osIpAddress.length() > 0 && isOsIpAddressFresh()) {
+      html += htmlEscape(osIpAddress);
+    }
+    html += "</strong></span></div>";
     html += "<p id='lockoutText' class='section-copy'>";
     if (lockoutActiveNow) {
       html += "Power-on lockout: " + String(lockoutRemainingSec) + "s remaining.";
@@ -1586,6 +1692,7 @@ void handleRoot() {
     html += "function syncConnectedStatus(d){";
     html += "var mbDot=document.getElementById('mbSignalDot');var mbText=document.getElementById('mbSignalText');";
     html += "var pDot=document.getElementById('powerDot');var pText=document.getElementById('powerText');";
+    html += "var osDot=document.getElementById('osIpDot');var osText=document.getElementById('osIpText');";
     html += "var lock=document.getElementById('lockoutText');var onBtn=document.getElementById('powerOnBtn');var offBtn=document.getElementById('powerOffBtn');";
     html += "var wifi=document.getElementById('wifiStatusLine');var bt=document.getElementById('bluetoothStatusTag');var api=document.getElementById('apiStatusTag');";
     html += "var bIn=document.getElementById('ledBootColorInput');var nIn=document.getElementById('ledStandbyColorInput');";
@@ -1594,6 +1701,7 @@ void handleRoot() {
     html += "var bb=document.getElementById('ledBootBreathInput');var nb=document.getElementById('ledStandbyBreathInput');";
     html += "setDot(mbDot,!!d.mainBoardSignal);if(mbText){mbText.textContent=d.mainBoardSignalText||'Unknown';}";
     html += "setDot(pDot,!!d.powerEnabled);if(pText){pText.textContent=d.powerText||'Unknown';}";
+    html += "var osConnected=!!d.osConnected;setDot(osDot,osConnected);if(osText){osText.textContent=d.osIpAddress||'';}";
     html += "if(lock){if(d.lockoutActive){lock.textContent='Power-on lockout: '+String(d.lockoutRemainingSec||0)+'s remaining.';}else{lock.textContent='';}}";
     html += "if(onBtn){onBtn.disabled=!!d.powerEnabled||!!d.lockoutActive;}";
     html += "if(offBtn){offBtn.disabled=!d.powerEnabled;}";
@@ -1889,6 +1997,19 @@ void setupWifiWebUi() {
     osIpAddress = "";
   }
 
+  if (preferences.isKey(WIFI_PREF_KEY_OS_IP_TS)) {
+    osIpAddressUpdatedAt = preferences.getULong(WIFI_PREF_KEY_OS_IP_TS, 0);
+  } else {
+    osIpAddressUpdatedAt = 0;
+  }
+
+  if (!isOsIpAddressFresh()) {
+    osIpAddress = "";
+    osIpAddressUpdatedAt = 0;
+    preferences.remove(WIFI_PREF_KEY_OS_IP);
+    preferences.remove(WIFI_PREF_KEY_OS_IP_TS);
+  }
+
   ledColorBooting = loadLedColorPreference(WIFI_PREF_KEY_LED_BOOT, ledColorBooting);
   ledColorStandby = loadLedColorPreference(WIFI_PREF_KEY_LED_NORMAL, ledColorStandby);
   uint8_t legacyIntensity = 80;
@@ -1998,12 +2119,24 @@ void setupWifiWebUi() {
   webServer.on("/favicon.ico", HTTP_GET, []() {
     webServer.send(204, "image/x-icon", "");
   });
+  webServer.on("/apple-touch-icon.png", HTTP_GET, []() {
+    webServer.send(204, "image/png", "");
+  });
+  webServer.on("/apple-touch-icon-precomposed.png", HTTP_GET, []() {
+    webServer.send(204, "image/png", "");
+  });
   registerCaptivePortalRoutes();
   webServer.onNotFound([]() {
+    String uri = webServer.uri();
+    if (uri == "/apple-touch-icon.png" || uri == "/apple-touch-icon-precomposed.png") {
+      webServer.send(204, "image/png", "");
+      return;
+    }
+
     Serial.print("[WEB] No handler for ");
     Serial.print(webServer.method() == HTTP_GET ? "GET" : (webServer.method() == HTTP_POST ? "POST" : "OTHER"));
     Serial.print(" ");
-    Serial.println(webServer.uri());
+    Serial.println(uri);
 
     if (wifiFallbackApEnabled) {
       webServer.sendHeader("Location", "/", true);
