@@ -799,6 +799,60 @@ void handleLogout() {
   sendRedirect("/login");
 }
 
+bool requestOsGracefulShutdown() {
+  if (!isMainboardSignalPresent() || osIpAddress.length() == 0 || !isOsIpAddressFresh()) {
+    return false;
+  }
+
+  WiFiClient client;
+  if (!client.connect(osIpAddress.c_str(), 8765)) {
+    Serial.println("[POWER] Graceful shutdown request failed: OS not reachable on port 8765");
+    return false;
+  }
+
+  String payload = "{\"action\":\"poweroff\"}";
+  String request = "POST /powermgt HTTP/1.1\r\n";
+  request += "Host: " + osIpAddress + ":8765\r\n";
+  request += "Connection: close\r\n";
+  request += "Content-Type: application/json\r\n";
+  request += "Content-Length: " + String(payload.length()) + "\r\n\r\n";
+  request += payload;
+
+  client.print(request);
+
+  unsigned long start = millis();
+  String response;
+  response.reserve(256);
+  while (millis() - start < 2000) {
+    while (client.available()) {
+      response += static_cast<char>(client.read());
+      if (response.length() >= 512) {
+        break;
+      }
+    }
+    if (response.length() > 0) {
+      break;
+    }
+    delay(10);
+  }
+
+  client.stop();
+
+  bool httpOk = response.indexOf("HTTP/1.1 200") >= 0 || response.indexOf("HTTP/1.1 202") >= 0 ||
+                response.indexOf("HTTP/1.0 200") >= 0 || response.indexOf("HTTP/1.0 202") >= 0;
+  bool bodyOk = response.indexOf("\"success\":true") >= 0 || response.indexOf("\"status\":\"ok\"") >= 0 ||
+                response.indexOf("\"status\": \"ok\"") >= 0 || response.indexOf("\"action\":\"poweroff\"") >= 0;
+
+  if (httpOk && (bodyOk || response.indexOf("poweroff") >= 0)) {
+    Serial.println("[POWER] Graceful OS shutdown request accepted");
+    return true;
+  }
+
+  Serial.print("[POWER] Graceful shutdown rejected by OS: ");
+  Serial.println(response.substring(0, min((unsigned int)160, response.length())));
+  return false;
+}
+
 void handlePowerToggle() {
   if (!isConnectedModeWebUi()) {
     sendRedirect("/");
@@ -816,8 +870,19 @@ void handlePowerToggle() {
   }
 
   String action = webServer.hasArg("action") ? webServer.arg("action") : String("toggle");
-  if (action != "on" && action != "off" && action != "toggle") {
+  if (action != "on" && action != "off" && action != "toggle" && action != "force-off") {
     connectedUiNotice = "Invalid power action.";
+    sendRedirect("/");
+    return;
+  }
+
+  if (action == "force-off") {
+    if (powerEnabled) {
+      disablePowerDrive();
+      connectedUiNotice = "Power output forced off.";
+    } else {
+      connectedUiNotice = "Power output is already disabled.";
+    }
     sendRedirect("/");
     return;
   }
@@ -844,11 +909,16 @@ void handlePowerToggle() {
       connectedUiNotice = "Power output is already enabled.";
     }
   } else {
-    if (powerEnabled) {
-      disablePowerDrive();
-      connectedUiNotice = "Power output disabled.";
-    } else {
+    if (!powerEnabled) {
       connectedUiNotice = "Power output is already disabled.";
+      sendRedirect("/");
+      return;
+    }
+
+    if (requestOsGracefulShutdown()) {
+      connectedUiNotice = "Shutdown requested to OS.";
+    } else {
+      connectedUiNotice = "OS shutdown request failed. Hold for 5s to force power off.";
     }
   }
 
@@ -1610,7 +1680,7 @@ void handleRoot() {
     }
     html += " id='powerOnBtn'";
     html += ">POWER ON</button></form>";
-    html += "<form method='POST' action='/power-toggle'><input type='hidden' name='action' value='off'><button class='btn btn-danger' type='submit'";
+    html += "<form method='POST' action='/power-toggle'><input type='hidden' name='action' value='off'><button class='btn btn-danger' type='button'";
     if (!powerEnabled) {
       html += " disabled";
     }
@@ -1719,6 +1789,8 @@ void handleRoot() {
     html += "if(bb&&typeof d.ledBootBreathingEnabled==='boolean'&&document.activeElement!==bb){bb.checked=!!d.ledBootBreathingEnabled;}";
     html += "if(nb&&typeof d.ledStandbyBreathingEnabled==='boolean'&&document.activeElement!==nb){nb.checked=!!d.ledStandbyBreathingEnabled;}";
     html += "}";
+    html += "async function submitPowerAction(action){var body='action='+encodeURIComponent(action);try{var res=await fetch('/power-toggle',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:body,cache:'no-store'});if(!res.ok&&res.status!==302){throw new Error('HTTP '+res.status);}window.location.reload();}catch(e){window.location.reload();}}";
+    html += "(function(){var offBtn=document.getElementById('powerOffBtn');if(!offBtn){return;}var holdTimer=null;var clearHold=function(){if(holdTimer){clearTimeout(holdTimer);holdTimer=null;}};offBtn.addEventListener('click',function(e){e.preventDefault();});offBtn.addEventListener('pointerdown',function(e){e.preventDefault();if(offBtn.disabled){return;}clearHold();holdTimer=setTimeout(function(){holdTimer=null;submitPowerAction('force-off');},5000);});offBtn.addEventListener('pointerup',function(e){e.preventDefault();if(holdTimer){clearHold();submitPowerAction('off');}});offBtn.addEventListener('pointerleave',function(){if(holdTimer){clearHold();submitPowerAction('off');}});offBtn.addEventListener('pointercancel',function(){if(holdTimer){clearHold();submitPowerAction('off');}});offBtn.addEventListener('blur',function(){if(holdTimer){clearHold();submitPowerAction('off');}});})();";
     html += "async function refreshConnectedStatus(){";
     html += "try{var res=await fetch('/connected-status',{cache:'no-store'});";
     html += "if(res.status===401){window.location='/login';return;}";
