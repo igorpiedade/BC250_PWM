@@ -33,7 +33,7 @@ static const int PIN_BUTTON_START = 18;     // Start button input
 static const int PIN_MB_STATUS = 34;        // Input from BC250: signal present = board ON
 static const int PIN_ARGB_DATA = 23;        // ARGB data output
 static const int PIN_BOARD_LED = 2;         // ESP32 Dev Module onboard LED
-static const uint16_t ARGB_LED_COUNT = 1;
+static const uint16_t ARGB_LED_COUNT = 10;
 
 // ------------------------------
 // Input behavior configuration
@@ -2513,6 +2513,23 @@ void loop() {
 
   // 2) If power drive is active, monitor motherboard status signal on GPIO34
   if (powerEnabled) {
+    if (consumeButtonPressedEdge()) {
+      offButtonPressTracking = true;
+      offButtonPressedAt = millis();
+      offButtonLongHoldHandled = false;
+    }
+
+    if (consumeButtonReleasedEdge() && offButtonPressTracking) {
+      unsigned long heldMs = millis() - offButtonPressedAt;
+      offButtonPressTracking = false;
+      offButtonLongHoldHandled = false;
+
+      if (heldMs < BUTTON_HOLD_TO_OFF_MS) {
+        Serial.println("[BUTTON] Short press while ON, requesting graceful OS shutdown");
+        requestOsGracefulShutdown();
+      }
+    }
+
     // 2.a) Manual power-off request via long press
     bool holdToOffArmed = (millis() - powerEnabledAt) >= BUTTON_HOLD_ARM_DELAY_MS;
     if (holdToOffArmed) {
