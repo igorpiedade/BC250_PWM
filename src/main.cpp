@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <DNSServer.h>
+#include <esp_ota_ops.h>
+#include <HTTPClient.h>
 #include <mbedtls/sha256.h>
 #include <Preferences.h>
 #include <Update.h>
@@ -80,9 +82,20 @@ static const char* WIFI_PREF_KEY_LED_SHUTDOWN_BREATH = "led_shut_b";
 static const char* WIFI_PREF_KEY_API_KEY = "api_key";
 static const char* WIFI_PREF_KEY_OS_IP = "os_ip";
 static const uint8_t API_KEY_LENGTH = 20;
+// OS API connection indicator: probe http://<os-ip>/autodiscover at most once
+// every 5 minutes, and only while the board signal (GPIO34) is present.
+static const unsigned long OS_API_PROBE_INTERVAL_MS = 300000;
+static const uint16_t OS_API_PROBE_TIMEOUT_MS = 2000;
 static const char* AUTH_DEFAULT_USERNAME = "admin";
 static const char* AUTH_DEFAULT_PASSWORD = "admin250";
 static const char* AUTH_SESSION_COOKIE = "SMSESSION";
+// OTA self-validation after an update: the new firmware boots in
+// pending-verify state and must prove it stays reachable. Once the network
+// is up for OTA_VALIDATE_MIN_UPTIME_MS the firmware is marked valid
+// (rollback canceled). If the network never comes up, the firmware rolls
+// itself back to the previous slot after OTA_VALIDATE_NETWORK_GRACE_MS.
+static const unsigned long OTA_VALIDATE_MIN_UPTIME_MS = 90000;
+static const unsigned long OTA_VALIDATE_NETWORK_GRACE_MS = 300000;
 
 bool powerEnabled = false;
 bool signalLossTimerRunning = false;
@@ -124,11 +137,16 @@ bool authForcePasswordChange = true;
 String authSessionId;
 String apiKey;
 String osIpAddress;
+bool osApiReachable = false;
+unsigned long osApiLastProbeAt = 0;
 String connectedUiNotice;
 bool firmwareUploadAuthorized = false;
 bool firmwareUploadStarted = false;
 bool firmwareUploadComplete = false;
 String firmwareUploadError;
+bool otaPendingValidation = false;
+bool otaFailedImagePresent = false;
+String otaRunningPartition = "unknown";
 
 struct RgbColor {
   uint8_t r;
@@ -157,6 +175,7 @@ uint8_t ledActiveCustom = LED_ACTIVE_NONE;
 void enablePowerDrive();
 void disablePowerDrive();
 String colorToHex(const RgbColor& color);
+const esp_partition_t* findRollbackPartition();
 
 int findCustomStateIndex(const String& name) {
   for (uint8_t i = 0; i < ledCustomCount; ++i) {
@@ -219,6 +238,61 @@ void removeCustomState(uint8_t index) {
 
 bool isMainboardSignalPresent() {
   return digitalRead(PIN_MB_STATUS) == MB_SIGNAL_PRESENT_LEVEL;
+}
+
+String osApiStatusText() {
+  if (osIpAddress.length() == 0) {
+    return "No address set";
+  }
+  return osApiReachable ? "Connected" : "Unreachable";
+}
+
+// Blocking GET with a short timeout; runs at most once per 5-minute window.
+bool probeOsApi() {
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + osIpAddress + "/autodiscover";
+  http.begin(client, url);
+  http.setConnectTimeout(OS_API_PROBE_TIMEOUT_MS);
+  http.setTimeout(OS_API_PROBE_TIMEOUT_MS);
+  int httpCode = http.GET();
+  http.end();
+
+  Serial.print("[OS API] GET ");
+  Serial.print(url);
+  Serial.print(" -> ");
+  Serial.println(httpCode);
+  return httpCode == HTTP_CODE_OK;
+}
+
+// Red while GPIO34 is missing (machine off, nothing to connect to); green once
+// the OS answers /autodiscover with HTTP 200. Status refreshes every 5 minutes.
+void updateOsApiStatus() {
+  if (!isMainboardSignalPresent()) {
+    osApiReachable = false;
+    osApiLastProbeAt = 0; // Re-probe as soon as the machine powers on again.
+    return;
+  }
+
+  if (osIpAddress.length() == 0 || WiFi.status() != WL_CONNECTED) {
+    osApiReachable = false;
+    osApiLastProbeAt = 0;
+    return;
+  }
+
+  if (osApiLastProbeAt != 0 && (millis() - osApiLastProbeAt) < OS_API_PROBE_INTERVAL_MS) {
+    return; // Keep the last known status until the next probe window.
+  }
+
+  osApiLastProbeAt = millis();
+  bool reachable = probeOsApi();
+  if (reachable != osApiReachable) {
+    osApiReachable = reachable;
+    Serial.print("[OS API] Indicator -> ");
+    Serial.println(reachable ? "Connected" : "Unreachable");
+  } else {
+    osApiReachable = reachable;
+  }
 }
 
 void beginWifiConnection(const String& ssid, const String& pass) {
@@ -817,6 +891,10 @@ void handleConnectedStatus() {
   json += ",\"wifiStatus\":\"" + jsonEscape(wifiStatus) + "\"";
   json += ",\"bluetoothStatus\":\"" + jsonEscape(bluetoothStatus) + "\"";
   json += ",\"apiStatus\":\"" + jsonEscape(apiStatus) + "\"";
+  json += ",\"osApiReachable\":";
+  json += osApiReachable ? "true" : "false";
+  json += ",\"osApiText\":\"" + jsonEscape(osApiStatusText()) + "\"";
+  json += ",\"osApiIp\":\"" + jsonEscape(osIpAddress) + "\"";
   json += ",\"ledStatus\":\"" + jsonEscape(ledStatus) + "\"";
   json += ",\"ledBootColor\":\"" + ledBootColor + "\"";
   json += ",\"ledStandbyColor\":\"" + ledStandbyColor + "\"";
@@ -826,6 +904,12 @@ void handleConnectedStatus() {
   json += ledBootingBreathingEnabled ? "true" : "false";
   json += ",\"ledStandbyBreathingEnabled\":";
   json += ledStandbyBreathingEnabled ? "true" : "false";
+  json += ",\"fwPartition\":\"" + jsonEscape(otaRunningPartition) + "\"";
+  json += ",\"fwMd5\":\"" + ESP.getSketchMD5() + "\"";
+  json += ",\"otaPending\":";
+  json += otaPendingValidation ? "true" : "false";
+  json += ",\"otaRollbackAvailable\":";
+  json += findRollbackPartition() != NULL ? "true" : "false";
   json += "}";
 
   webServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
@@ -925,6 +1009,8 @@ void handleApiSetOsAddress() {
 
   osIpAddress = parsed.toString();
   preferences.putString(WIFI_PREF_KEY_OS_IP, osIpAddress);
+  osApiReachable = false;
+  osApiLastProbeAt = 0; // Force a fresh probe against the new address.
 
   sendApiJson(200, "{\"success\":true,\"osAddress\":\"" + osIpAddress + "\"}");
 }
@@ -1305,6 +1391,138 @@ void handleApiKeyGenerate() {
   sendRedirect("/");
 }
 
+// ------------------------------
+// OTA rollback guard
+// ------------------------------
+const char* otaImageStateLabel(esp_ota_img_states_t state) {
+  switch (state) {
+    case ESP_OTA_IMG_NEW: return "new";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "pending-verify";
+    case ESP_OTA_IMG_VALID: return "valid";
+    case ESP_OTA_IMG_INVALID: return "invalid";
+    case ESP_OTA_IMG_ABORTED: return "aborted";
+    default: return "undefined";
+  }
+}
+
+// Returns the other OTA slot when it holds a bootable image that is not a
+// known failure (aborted/invalid). This is the firmware we can fall back to.
+const esp_partition_t* findRollbackPartition() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (running == NULL) {
+    return NULL;
+  }
+  const esp_partition_t* candidate = esp_ota_get_next_update_partition(running);
+  if (candidate == NULL) {
+    return NULL;
+  }
+  esp_app_desc_t desc;
+  if (esp_ota_get_partition_description(candidate, &desc) != ESP_OK) {
+    return NULL; // Other slot has no bootable image.
+  }
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (esp_ota_get_state_partition(candidate, &state) == ESP_OK &&
+      (state == ESP_OTA_IMG_ABORTED || state == ESP_OTA_IMG_INVALID)) {
+    return NULL; // Never roll back into a known-bad image.
+  }
+  return candidate;
+}
+
+// Boot-time OTA diagnostics: which slot we run from, its state, and whether a
+// fallback image exists. Also arms the pending-validation watchdog when the
+// bootloader started a not-yet-confirmed image.
+void initOtaGuard() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (running == NULL) {
+    Serial.println("[OTA] ERROR: no running app partition detected");
+    return;
+  }
+  otaRunningPartition = running->label;
+
+  esp_ota_img_states_t runningState = ESP_OTA_IMG_UNDEFINED;
+  bool hasState = esp_ota_get_state_partition(running, &runningState) == ESP_OK;
+
+  Serial.print("[OTA] Running partition: ");
+  Serial.print(running->label);
+  Serial.print(" @ 0x");
+  Serial.print(running->address, HEX);
+  Serial.print(", size 0x");
+  Serial.print(running->size, HEX);
+  Serial.print(", state: ");
+  Serial.println(hasState ? otaImageStateLabel(runningState) : "unknown");
+  Serial.print("[OTA] Sketch MD5: ");
+  Serial.println(ESP.getSketchMD5());
+
+  const esp_partition_t* next = esp_ota_get_next_update_partition(running);
+  if (next != NULL) {
+    esp_ota_img_states_t nextState = ESP_OTA_IMG_UNDEFINED;
+    bool hasNextState = esp_ota_get_state_partition(next, &nextState) == ESP_OK;
+    Serial.print("[OTA] Other OTA slot: ");
+    Serial.print(next->label);
+    Serial.print(", state: ");
+    Serial.println(hasNextState ? otaImageStateLabel(nextState) : "no otadata entry");
+    otaFailedImagePresent = hasNextState && (nextState == ESP_OTA_IMG_ABORTED || nextState == ESP_OTA_IMG_INVALID);
+  } else {
+    Serial.println("[OTA] WARNING: no second OTA slot; check board_build.partitions");
+  }
+
+  if (hasState && runningState == ESP_OTA_IMG_PENDING_VERIFY) {
+    otaPendingValidation = true;
+    Serial.println("[OTA] New firmware is PENDING VALIDATION. If the board reboots before");
+    Serial.println("[OTA] it is confirmed, the bootloader restores the previous firmware.");
+  }
+  if (otaFailedImagePresent) {
+    Serial.println("[OTA] The other slot holds a failed image (a previous update was rolled back).");
+  }
+  Serial.print("[OTA] Rollback target available: ");
+  Serial.println(findRollbackPartition() != NULL ? "yes" : "no");
+}
+
+void confirmOtaFirmware(const char* reason) {
+  if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+    otaPendingValidation = false;
+    Serial.print("[OTA] Firmware validated (");
+    Serial.print(reason);
+    Serial.println("); rollback canceled");
+  } else {
+    Serial.println("[OTA] Failed to mark firmware valid");
+  }
+}
+
+// Pending-validation watchdog, called from loop(). Confirms the firmware once
+// the network is usable; if the board stays unreachable past the grace period
+// (and the power output is off), rolls back and reboots into the previous
+// firmware so a bad update can never leave the board stranded.
+void updateOtaValidation() {
+  if (!otaPendingValidation) {
+    return;
+  }
+  bool networkUsable = webServerStarted && (WiFi.status() == WL_CONNECTED || wifiFallbackApEnabled);
+  if (networkUsable && millis() >= OTA_VALIDATE_MIN_UPTIME_MS) {
+    confirmOtaFirmware("network up");
+    return;
+  }
+
+  static bool rollbackRebootRequested = false;
+  static bool deferredByPowerLogged = false;
+  if (!networkUsable && millis() >= OTA_VALIDATE_NETWORK_GRACE_MS) {
+    if (powerEnabled) {
+      if (!deferredByPowerLogged) {
+        deferredByPowerLogged = true;
+        Serial.println("[OTA] Rollback deferred while the power output is ON");
+      }
+      return;
+    }
+    if (rollbackRebootRequested) {
+      return;
+    }
+    rollbackRebootRequested = true;
+    Serial.println("[OTA] No network after update; marking firmware invalid and");
+    Serial.println("[OTA] rolling back to the previous firmware");
+    esp_ota_mark_app_invalid_rollback_and_reboot(); // Reboots on success.
+  }
+}
+
 void handleFirmwareUpload() {
   HTTPUpload& upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
@@ -1384,7 +1602,47 @@ void handleFirmwareUpdate() {
     return;
   }
 
-  webServer.send(200, "text/html", "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Firmware update</title></head><body><p>Firmware updated. The board is restarting.</p></body></html>");
+  webServer.send(200, "text/html", "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Firmware update</title></head><body><p>Firmware updated. The board is restarting to validate the new firmware; if validation fails, the previous firmware is restored automatically.</p></body></html>");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleFirmwareRollback() {
+  if (!isConnectedModeWebUi()) {
+    sendRedirect("/");
+    return;
+  }
+  if (!isAuthenticated()) {
+    sendRedirect("/login");
+    return;
+  }
+  if (authForcePasswordChange) {
+    sendRedirect("/change-password");
+    return;
+  }
+
+  if (powerEnabled) {
+    connectedUiNotice = "Turn the power output off before rolling back firmware.";
+    sendRedirect("/");
+    return;
+  }
+
+  const esp_partition_t* target = findRollbackPartition();
+  if (target == NULL) {
+    connectedUiNotice = "No previous firmware available to roll back to.";
+    sendRedirect("/");
+    return;
+  }
+
+  if (esp_ota_set_boot_partition(target) != ESP_OK) {
+    connectedUiNotice = "Rollback failed: could not switch the boot partition.";
+    sendRedirect("/");
+    return;
+  }
+
+  Serial.print("[OTA] Rolling back to previous firmware in slot ");
+  Serial.println(target->label);
+  webServer.send(200, "text/html", "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Firmware rollback</title></head><body><p>Rolling back to the previous firmware. The board is restarting.</p></body></html>");
   delay(1000);
   ESP.restart();
 }
@@ -1520,6 +1778,14 @@ void handleRoot() {
       html += "<form class='api-key-form' method='POST' action='/api-key/generate'><button class='link-btn' type='submit'>Set new key</button></form>";
     }
     html += "</div>";
+    html += "<div class='indicator-row'><span id='osApiDot' class='dot ";
+    html += osApiReachable ? "dot-green" : "dot-red";
+    html += "'></span><span>OS API: <strong id='osApiText'>";
+    html += osApiStatusText();
+    html += "</strong></span></div>";
+    html += "<p id='osApiIpLine' class='section-copy' style='margin:4px 0 0;'>OS address: ";
+    html += osIpAddress.length() > 0 ? htmlEscape(osIpAddress) : "not set (POST /setosaddress)";
+    html += "</p>";
     html += "<span id='apiStatusTag' class='section-tag'>";
     html += apiKey.length() > 0 ? "Key configured" : "No key set";
     html += "</span></article>";
@@ -1569,10 +1835,30 @@ void handleRoot() {
     html += "</article>";
     html += "</section>";
     html += "<section class='panel panel-main'><h2 class='section-title'>Firmware Update</h2>";
-    html += "<p class='section-copy'>Upload a compiled ESP32 .bin firmware file. The power output must be off. The board restarts after a successful update.</p>";
+    html += "<p class='section-copy'>Upload a compiled ESP32 .bin firmware file. The power output must be off. The board restarts after a successful update and validates the new firmware automatically. If validation fails, the previous firmware is restored.</p>";
+    html += "<p id='fwPartitionLine' class='section-copy' style='margin:4px 0 0;'>Running: " + htmlEscape(otaRunningPartition) + " - MD5 " + ESP.getSketchMD5().substring(0, 8) + "</p>";
+    if (otaPendingValidation) {
+      html += "<p id='otaPendingLine' class='section-copy' style='margin:4px 0 0;color:#ffc078;'><strong>New firmware is pending validation.</strong> It confirms automatically once the network is up; if the board stays unreachable it rolls back to the previous firmware and restarts.</p>";
+    } else {
+      html += "<p id='otaPendingLine' class='section-copy' style='margin:4px 0 0;color:#ffc078;display:none;'></p>";
+    }
+    if (otaFailedImagePresent) {
+      html += "<p class='section-copy' style='margin:4px 0 0;color:#ff8787;'>A previous update failed validation and was rolled back. The failed image stays in the other slot until the next update overwrites it.</p>";
+    }
     html += "<form class='firmware-form' method='POST' action='/update' enctype='multipart/form-data'>";
     html += "<input type='file' name='firmware' accept='.bin,application/octet-stream' required>";
-    html += "<button class='btn' type='submit'>UPLOAD FIRMWARE</button></form></section>";
+    html += "<button class='btn' type='submit'>UPLOAD FIRMWARE</button></form>";
+    const esp_partition_t* rollbackTarget = findRollbackPartition();
+    if (rollbackTarget != NULL) {
+      html += "<form class='firmware-form' method='POST' action='/rollback-firmware' onsubmit='return confirm(\"Roll back to the previous firmware and restart? The power output must be off.\");'>";
+      html += "<p class='section-copy' style='margin:0;'>Fallback available: previous firmware in slot " + String(rollbackTarget->label) + ".</p>";
+      html += "<button class='btn btn-danger' type='submit'";
+      if (powerEnabled) {
+        html += " disabled";
+      }
+      html += ">ROLL BACK TO PREVIOUS FIRMWARE</button></form>";
+    }
+    html += "</section>";
     html += "<section class='panel panel-main'>";
     html += "<p class='line'>Connected mode active.</p>";
     html += "<p id='wifiStatusLine' class='line'>" + htmlEscape(wifiModeLabel()) + "</p>";
@@ -1588,6 +1874,8 @@ void handleRoot() {
     html += "var pDot=document.getElementById('powerDot');var pText=document.getElementById('powerText');";
     html += "var lock=document.getElementById('lockoutText');var onBtn=document.getElementById('powerOnBtn');var offBtn=document.getElementById('powerOffBtn');";
     html += "var wifi=document.getElementById('wifiStatusLine');var bt=document.getElementById('bluetoothStatusTag');var api=document.getElementById('apiStatusTag');";
+    html += "var osDot=document.getElementById('osApiDot');var osText=document.getElementById('osApiText');var osIp=document.getElementById('osApiIpLine');";
+    html += "var fwLine=document.getElementById('fwPartitionLine');var pend=document.getElementById('otaPendingLine');";
     html += "var bIn=document.getElementById('ledBootColorInput');var nIn=document.getElementById('ledStandbyColorInput');";
     html += "var bi=document.getElementById('ledBootIntensityInput');var ni=document.getElementById('ledStandbyIntensityInput');";
     html += "var bt=document.getElementById('ledBootIntensityText');var nt=document.getElementById('ledStandbyIntensityText');";
@@ -1600,6 +1888,10 @@ void handleRoot() {
     html += "if(wifi){wifi.textContent=d.wifiStatus||'';}";
     html += "if(bt){bt.textContent=d.bluetoothStatus||'Coming soon';}";
     html += "if(api){api.textContent=d.apiStatus||'No key set';}";
+    html += "setDot(osDot,!!d.osApiReachable);if(osText){osText.textContent=d.osApiText||'Unreachable';}";
+    html += "if(osIp){osIp.textContent=d.osApiIp?('OS address: '+d.osApiIp):'OS address: not set (POST /setosaddress)';}";
+    html += "if(fwLine){fwLine.textContent='Running: '+(d.fwPartition||'?')+' - MD5 '+String(d.fwMd5||'').substring(0,8);}";
+    html += "if(pend){if(d.otaPending){pend.style.display='';pend.innerHTML='<strong>New firmware is pending validation.</strong> It confirms automatically once the network is up; if the board stays unreachable it rolls back and restarts.';}else{pend.style.display='none';}}";
     html += "setSwatch('ledBootSwatch',d.ledBootColor);setSwatch('ledStandbySwatch',d.ledStandbyColor);";
     html += "setText('ledBootText',d.ledBootColor||'');setText('ledStandbyText',d.ledStandbyColor||'');";
     html += "if(bIn&&d.ledBootColor&&document.activeElement!==bIn){bIn.value=d.ledBootColor;}";
@@ -1983,6 +2275,7 @@ void setupWifiWebUi() {
   webServer.on("/led-custom", HTTP_POST, handleLedCustom);
   webServer.on("/api-key/generate", HTTP_POST, handleApiKeyGenerate);
   webServer.on("/update", HTTP_POST, handleFirmwareUpdate, handleFirmwareUpload);
+  webServer.on("/rollback-firmware", HTTP_POST, handleFirmwareRollback);
   webServer.on("/connected-status", HTTP_GET, handleConnectedStatus);
   webServer.on("/status", HTTP_GET, handleApiStatus);
   webServer.on("/poweron", HTTP_POST, handleApiPowerOn);
@@ -2239,6 +2532,8 @@ void disablePowerDrive() {
 void setup() {
   Serial.begin(115200);
 
+  initOtaGuard();
+
   pinMode(PIN_TRANSISTOR_DRIVE, OUTPUT);
   digitalWrite(PIN_TRANSISTOR_DRIVE, LOW);
   pinMode(PIN_BOARD_LED, OUTPUT);
@@ -2371,6 +2666,8 @@ void loop() {
   updateFallbackHoldIndicator();
   renderArgb();
   updateWifiState();
+  updateOsApiStatus();
+  updateOtaValidation();
 
   delay(5);
 }

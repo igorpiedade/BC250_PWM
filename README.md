@@ -34,7 +34,7 @@ HTTP 401
 | GET    | `/status`       | Device and power status                            |
 | POST   | `/poweron`      | Turn the GPIO power driver ON                      |
 | POST   | `/shutdown`     | Turn the GPIO power driver OFF                     |
-| POST   | `/setosaddress` | Store the OS IP address for future use             |
+| POST   | `/setosaddress` | Store the OS IP address (drives the OS API indicator) |
 | GET    | `/setLED`       | List all LED states (built-in + custom)            |
 | POST   | `/setLED`       | Edit built-in / create-edit custom / activate state |
 
@@ -92,7 +92,15 @@ curl -X POST -H "Authorization: Bearer $KEY" http://<esp-ip>/shutdown
 
 #### `POST /setosaddress`
 
-Stores the OS IP address on the device (persisted across reboots) for future integrations.
+Stores the OS IP address on the device (persisted across reboots). The address drives
+the **OS API connection indicator** in the connected WebUI (API Settings panel):
+
+- While the board signal (GPIO34) is **missing**, the indicator is always red — a
+  powered-off machine cannot answer.
+- While GPIO34 is **present**, the device probes `GET http://<os-ip>/autodiscover`
+  and turns the indicator green on an HTTP 200 response, e.g. `{"status":"ok","ip":"192.168.1.50"}`.
+- Probes repeat at most once every 5 minutes (`OS_API_PROBE_INTERVAL_MS`) to avoid
+  flooding the OS; saving a new address forces an immediate re-probe.
 
 | Parameter | Required | Description            |
 |-----------|----------|------------------------|
@@ -206,3 +214,34 @@ curl -X POST -H "Authorization: Bearer $KEY" "http://<esp-ip>/setLED?clear=1"
 pio run                    # build
 pio run --target upload    # flash over /dev/cu.SLAB_USBtoUART
 ```
+
+## OTA firmware updates & rollback
+
+The partition table is pinned to `min_spiffs.csv` (`board_build.partitions` in
+`platformio.ini`): two OTA app slots (`app0`/`app1`, 1.9 MB each) plus `otadata`.
+The ESP32 bootloader has app rollback enabled and the firmware cooperates with it:
+
+- After an OTA upload, the board restarts into the new slot in **pending
+  validation** state (`ESP_OTA_IMG_PENDING_VERIFY`).
+- The new firmware must prove it stays reachable: once the network is up for
+  `OTA_VALIDATE_MIN_UPTIME_MS` (90 s) it calls
+  `esp_ota_mark_app_valid_cancel_rollback()` and the update becomes permanent.
+- Any reboot before confirmation (crash, watchdog, power loss) makes the
+  bootloader restore the previous firmware automatically.
+- If the network never comes up within `OTA_VALIDATE_NETWORK_GRACE_MS` (5 min)
+  while the power output is off, the firmware marks itself invalid and reboots
+  into the previous slot (`esp_ota_mark_app_invalid_rollback_and_reboot()`).
+
+### Manual fallback
+
+The WebUI **Firmware Update** panel shows the running slot, sketch MD5, and
+validation state, plus a **ROLL BACK TO PREVIOUS FIRMWARE** button whenever the
+other slot holds a known-good image (power output must be off). Rolling back into
+an image that already failed validation is refused.
+
+Boot-time Serial logs (`[OTA] ...`) print the running partition, its otadata
+state, the other slot's state, and whether a rollback target exists.
+
+> **Note:** the partition-table change cannot be applied over OTA. Flash once over
+> USB after pulling this change (`pio run --target upload`). WiFi credentials and
+> other Preferences survive because the `nvs` partition offset is unchanged.
