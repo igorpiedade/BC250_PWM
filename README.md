@@ -29,13 +29,13 @@ HTTP 401
 
 ### Endpoints
 
-| Method | Route           | Description                                        |
-|--------|-----------------|----------------------------------------------------|
-| GET    | `/status`       | Device and power status                            |
-| POST   | `/poweron`      | Turn the GPIO power driver ON                      |
-| POST   | `/shutdown`     | Turn the GPIO power driver OFF                     |
-| POST   | `/setosaddress` | Store the OS IP address (drives the OS API indicator) |
-| GET    | `/setLED`       | List all LED states (built-in + custom)            |
+| Method | Route           | Description                                         |
+| ------ | --------------- | --------------------------------------------------- |
+| GET    | `/status`       | Device and power status                             |
+| POST   | `/poweron`      | Turn the GPIO power driver ON                       |
+| POST   | `/shutdown`     | Turn the GPIO power driver OFF                      |
+| POST   | `/setosaddress` | Store the OS IP address (drives the OS indicator)   |
+| GET    | `/setLED`       | List all LED states (built-in + custom)             |
 | POST   | `/setLED`       | Edit built-in / create-edit custom / activate state |
 
 ---
@@ -67,7 +67,7 @@ curl -X POST -H "Authorization: Bearer $KEY" http://<esp-ip>/poweron
 ```
 
 ```json
-{"success":true,"changed":true,"powerEnabled":true,"powerStatus":"ON"}
+{ "success": true, "changed": true, "powerEnabled": true, "powerStatus": "ON" }
 ```
 
 Power-on requests are rejected while the safety lockout is active
@@ -87,7 +87,12 @@ curl -X POST -H "Authorization: Bearer $KEY" http://<esp-ip>/shutdown
 ```
 
 ```json
-{"success":true,"changed":true,"powerEnabled":false,"powerStatus":"OFF"}
+{
+  "success": true,
+  "changed": true,
+  "powerEnabled": false,
+  "powerStatus": "OFF"
+}
 ```
 
 #### `POST /setosaddress`
@@ -102,8 +107,8 @@ the **OS API connection indicator** in the connected WebUI (API Settings panel):
 - Probes repeat at most once every 5 minutes (`OS_API_PROBE_INTERVAL_MS`) to avoid
   flooding the OS; saving a new address forces an immediate re-probe.
 
-| Parameter | Required | Description            |
-|-----------|----------|------------------------|
+| Parameter | Required | Description                        |
+| --------- | -------- | ---------------------------------- |
 | `ip`      | yes      | IPv4 address, e.g. `192.168.1.100` |
 
 ```bash
@@ -111,7 +116,7 @@ curl -X POST -H "Authorization: Bearer $KEY" "http://<esp-ip>/setosaddress?ip=19
 ```
 
 ```json
-{"success":true,"osAddress":"192.168.1.100"}
+{ "success": true, "osAddress": "192.168.1.100" }
 ```
 
 Invalid or missing IP → `HTTP 400 {"success":false,"error":"invalid ip address"}`
@@ -129,9 +134,30 @@ curl -H "Authorization: Bearer $KEY" http://<esp-ip>/setLED
   "success": true,
   "activeCustom": "downloading",
   "states": [
-    {"name":"booting","builtin":true,"color":"#FF8C00","intensity":80,"breathing":true,"allowedOff":false},
-    {"name":"standby","builtin":true,"color":"#1E1E1E","intensity":30,"breathing":false,"allowedOff":true},
-    {"name":"downloading","builtin":false,"color":"#00FF00","intensity":60,"breathing":true,"allowedOff":true}
+    {
+      "name": "booting",
+      "builtin": true,
+      "color": "#FF8C00",
+      "intensity": 80,
+      "breathing": true,
+      "allowedOff": false
+    },
+    {
+      "name": "standby",
+      "builtin": true,
+      "color": "#1E1E1E",
+      "intensity": 30,
+      "breathing": false,
+      "allowedOff": true
+    },
+    {
+      "name": "downloading",
+      "builtin": false,
+      "color": "#00FF00",
+      "intensity": 60,
+      "breathing": true,
+      "allowedOff": true
+    }
   ]
 }
 ```
@@ -140,16 +166,17 @@ curl -H "Authorization: Bearer $KEY" http://<esp-ip>/setLED
 
 The two automatic states are `booting` (GPIO25 ON) and `standby` (GPIO25 OFF).
 
-| Parameter   | Required | Description                                       |
-|-------------|----------|---------------------------------------------------|
-| `preset`    | yes      | `booting` or `standby`                            |
-| `color`     | no       | `#RRGGBB` (URL-encode `#` as `%23`)               |
-| `intensity` | no       | `5`–`100`                                          |
-| `breathing` | no       | `true`/`false`                                     |
+| Parameter   | Required | Description                         |
+| ----------- | -------- | ----------------------------------- |
+| `preset`    | yes      | `booting` or `standby`              |
+| `color`     | no       | `#RRGGBB` (URL-encode `#` as `%23`) |
+| `intensity` | no       | `5`–`100`                           |
+| `breathing` | no       | `true`/`false`                      |
+| `allowoff`  | no       | `true`/`false`                      |
 
 ```bash
 curl -X POST -H "Authorization: Bearer $KEY" \
-  "http://<esp-ip>/setLED?preset=standby&color=%231E1E1E&intensity=30"
+  "http://<esp-ip>/setLED?preset=standby&color=%231E1E1E&intensity=30&allowoff=true"
 ```
 
 #### `POST /setLED` — create or edit a custom state
@@ -157,13 +184,13 @@ curl -X POST -H "Authorization: Bearer $KEY" \
 Custom states are created in the WebUI (LED Management → **+ New State**) or here by name.
 Up to 8 custom states are stored on the device.
 
-| Parameter   | Required | Description                                       |
-|-------------|----------|---------------------------------------------------|
-| `name`      | yes      | 1–16 chars, unique (not `booting`/`standby`)      |
-| `color`     | no       | `#RRGGBB`                                          |
-| `intensity` | no       | `5`–`100`                                          |
-| `breathing` | no       | `true`/`false`                                     |
-| `allowoff`  | no       | `true` = may render while GPIO25 is OFF           |
+| Parameter   | Required | Description                                  |
+| ----------- | -------- | -------------------------------------------- |
+| `name`      | yes      | 1–16 chars, unique (not `booting`/`standby`) |
+| `color`     | no       | `#RRGGBB`                                    |
+| `intensity` | no       | `5`–`100`                                    |
+| `breathing` | no       | `true`/`false`                               |
+| `allowoff`  | no       | `true` = may render while GPIO25 is OFF      |
 
 ```bash
 curl -X POST -H "Authorization: Bearer $KEY" \
@@ -171,7 +198,14 @@ curl -X POST -H "Authorization: Bearer $KEY" \
 ```
 
 ```json
-{"success":true,"state":"downloading","color":"#00FF00","intensity":60,"breathing":true,"allowedOff":true}
+{
+  "success": true,
+  "state": "downloading",
+  "color": "#00FF00",
+  "intensity": 60,
+  "breathing": true,
+  "allowedOff": true
+}
 ```
 
 #### `POST /setLED` — activate / clear a state
@@ -189,16 +223,16 @@ curl -X POST -H "Authorization: Bearer $KEY" "http://<esp-ip>/setLED?clear=1"
 ```
 
 ```json
-{"success":true,"activeCustom":"downloading"}
+{ "success": true, "activeCustom": "downloading" }
 ```
 
 ### Error responses
 
-| Code | Cause                                            |
-|------|--------------------------------------------------|
-| 400  | Missing/invalid parameter                        |
-| 401  | Missing or wrong `Authorization: Bearer` key     |
-| 409  | `/poweron` rejected: power-on lockout active     |
+| Code | Cause                                        |
+| ---- | -------------------------------------------- |
+| 400  | Missing/invalid parameter                    |
+| 401  | Missing or wrong `Authorization: Bearer` key |
+| 409  | `/poweron` rejected: power-on lockout active |
 
 ## WebUI
 

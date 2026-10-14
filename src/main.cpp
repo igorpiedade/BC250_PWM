@@ -35,7 +35,7 @@ static const int PIN_BUTTON_START = 18;     // Start button input
 static const int PIN_MB_STATUS = 34;        // Input from BC250: signal present = board ON
 static const int PIN_ARGB_DATA = 23;        // ARGB data output
 static const int PIN_BOARD_LED = 2;         // ESP32 Dev Module onboard LED
-static const uint16_t ARGB_LED_COUNT = 1;
+static const uint16_t ARGB_LED_COUNT = 10;
 
 // ------------------------------
 // Input behavior configuration
@@ -79,8 +79,14 @@ static const char* WIFI_PREF_KEY_LED_SHUTDOWN_INTENSITY = "led_shut_i";
 static const char* WIFI_PREF_KEY_LED_BOOT_BREATH = "led_boot_b";
 static const char* WIFI_PREF_KEY_LED_NORMAL_BREATH = "led_norm_b";
 static const char* WIFI_PREF_KEY_LED_SHUTDOWN_BREATH = "led_shut_b";
+static const char* WIFI_PREF_KEY_LED_BOOT_ALLOW_OFF = "led_boot_off";
+static const char* WIFI_PREF_KEY_LED_STANDBY_ALLOW_OFF = "led_stby_off";
+static const char* WIFI_PREF_KEY_LED_NORMAL_ALLOW_OFF = "led_norm_off";
+static const char* WIFI_PREF_KEY_LED_SHUTDOWN_ALLOW_OFF = "led_shut_off";
 static const char* WIFI_PREF_KEY_API_KEY = "api_key";
 static const char* WIFI_PREF_KEY_OS_IP = "os_ip";
+static const char* WIFI_PREF_KEY_OS_IP_TS = "os_ip_ts";
+static const unsigned long OS_IP_MAX_AGE_MS = 24UL * 60UL * 60UL * 1000UL;
 static const uint8_t API_KEY_LENGTH = 20;
 // OS API connection indicator: probe http://<os-ip>/autodiscover at most once
 // every 5 minutes, and only while the board signal (GPIO34) is present.
@@ -137,8 +143,9 @@ bool authForcePasswordChange = true;
 String authSessionId;
 String apiKey;
 String osIpAddress;
-bool osApiReachable = false;
-unsigned long osApiLastProbeAt = 0;
+unsigned long osIpAddressUpdatedAt = 0;
+bool osEndpointReachable = false;
+unsigned long osEndpointLastCheckedAt = 0;
 String connectedUiNotice;
 bool firmwareUploadAuthorized = false;
 bool firmwareUploadStarted = false;
@@ -155,13 +162,24 @@ struct RgbColor {
 };
 
 // Automatic states: Booting (GPIO25 ON) and Standby (GPIO25 OFF).
+// Manual preset states: Normal and ShuttingDown are activated via API only.
 // Custom states are stored by name in Preferences and activated by API.
 RgbColor ledColorBooting = {255, 140, 0};
 RgbColor ledColorStandby = {30, 30, 30};
+RgbColor ledColorNormal = {255, 255, 255};
+RgbColor ledColorShuttingDown = {0, 120, 255};
 uint8_t ledBootingIntensityPct = 80;
 uint8_t ledStandbyIntensityPct = 30;
+uint8_t ledNormalIntensityPct = 80;
+uint8_t ledShuttingDownIntensityPct = 65;
 bool ledBootingBreathingEnabled = true;
 bool ledStandbyBreathingEnabled = false;
+bool ledNormalBreathingEnabled = false;
+bool ledShuttingDownBreathingEnabled = true;
+bool ledBootingAllowedOff = false;
+bool ledStandbyAllowedOff = true;
+bool ledNormalAllowedOff = true;
+bool ledShuttingDownAllowedOff = true;
 
 // Custom states: parallel arrays persisted as led_c<i>_name/color/int/breath/allowoff.
 String ledCustomNames[LED_MAX_CUSTOM_STATES];
@@ -171,6 +189,12 @@ bool ledCustomBreathings[LED_MAX_CUSTOM_STATES];
 bool ledCustomAllowedOff[LED_MAX_CUSTOM_STATES];
 uint8_t ledCustomCount = 0;
 uint8_t ledActiveCustom = LED_ACTIVE_NONE;
+enum class LedManualPreset {
+  None,
+  Normal,
+  ShuttingDown,
+};
+LedManualPreset ledActiveManualPreset = LedManualPreset::None;
 
 void enablePowerDrive();
 void disablePowerDrive();
@@ -240,59 +264,81 @@ bool isMainboardSignalPresent() {
   return digitalRead(PIN_MB_STATUS) == MB_SIGNAL_PRESENT_LEVEL;
 }
 
-String osApiStatusText() {
-  if (osIpAddress.length() == 0) {
-    return "No address set";
+bool isOsIpAddressFresh() {
+  if (osIpAddress.length() == 0 || osIpAddressUpdatedAt == 0) {
+    return false;
   }
-  return osApiReachable ? "Connected" : "Unreachable";
+  return (millis() - osIpAddressUpdatedAt) <= OS_IP_MAX_AGE_MS;
 }
 
-// Blocking GET with a short timeout; runs at most once per 5-minute window.
-bool probeOsApi() {
-  WiFiClient client;
-  HTTPClient http;
-  String url = "http://" + osIpAddress + "/autodiscover";
-  http.begin(client, url);
-  http.setConnectTimeout(OS_API_PROBE_TIMEOUT_MS);
-  http.setTimeout(OS_API_PROBE_TIMEOUT_MS);
-  int httpCode = http.GET();
-  http.end();
-
-  Serial.print("[OS API] GET ");
-  Serial.print(url);
-  Serial.print(" -> ");
-  Serial.println(httpCode);
-  return httpCode == HTTP_CODE_OK;
-}
-
-// Red while GPIO34 is missing (machine off, nothing to connect to); green once
-// the OS answers /autodiscover with HTTP 200. Status refreshes every 5 minutes.
-void updateOsApiStatus() {
+bool refreshOsEndpointReachability() {
   if (!isMainboardSignalPresent()) {
-    osApiReachable = false;
-    osApiLastProbeAt = 0; // Re-probe as soon as the machine powers on again.
-    return;
+    osEndpointReachable = false;
+    return false;
   }
 
-  if (osIpAddress.length() == 0 || WiFi.status() != WL_CONNECTED) {
-    osApiReachable = false;
-    osApiLastProbeAt = 0;
-    return;
+  if (osIpAddress.length() == 0 || !isOsIpAddressFresh()) {
+    osEndpointReachable = false;
+    return false;
   }
 
-  if (osApiLastProbeAt != 0 && (millis() - osApiLastProbeAt) < OS_API_PROBE_INTERVAL_MS) {
-    return; // Keep the last known status until the next probe window.
+  unsigned long now = millis();
+  if (osEndpointLastCheckedAt != 0 && (now - osEndpointLastCheckedAt) < (5UL * 60UL * 1000UL)) {
+    return osEndpointReachable;
+  }
+  osEndpointLastCheckedAt = now;
+
+  WiFiClient client;
+  const uint32_t connectTimeoutMs = 1000;
+  const uint32_t responseTimeoutMs = 1500;
+
+  unsigned long connectStart = millis();
+  while (millis() - connectStart < connectTimeoutMs) {
+    if (client.connect(osIpAddress.c_str(), 8765)) {
+      break;
+    }
+    delay(20);
   }
 
-  osApiLastProbeAt = millis();
-  bool reachable = probeOsApi();
-  if (reachable != osApiReachable) {
-    osApiReachable = reachable;
-    Serial.print("[OS API] Indicator -> ");
-    Serial.println(reachable ? "Connected" : "Unreachable");
-  } else {
-    osApiReachable = reachable;
+  if (!client.connected()) {
+    osEndpointReachable = false;
+    client.stop();
+    return false;
   }
+
+  client.setTimeout(1000);
+  client.print(F("GET /autodiscover HTTP/1.1\r\n"));
+  client.print(F("Host: "));
+  client.print(osIpAddress);
+  client.print(F("\r\n"));
+  client.print(F("Connection: close\r\n\r\n"));
+
+  unsigned long start = millis();
+  String response;
+  response.reserve(256);
+  while (millis() - start < responseTimeoutMs) {
+    while (client.available()) {
+      char c = static_cast<char>(client.read());
+      response += c;
+      if (response.length() >= 512) {
+        break;
+      }
+    }
+
+    if (response.length() > 0) {
+      break;
+    }
+    delay(10);
+  }
+
+  client.stop();
+
+  bool httpOk = response.indexOf("HTTP/1.1 200") >= 0 || response.indexOf("HTTP/1.0 200") >= 0;
+  bool statusOk = response.indexOf("\"status\":\"ok\"") >= 0 || response.indexOf("\"status\": \"ok\"") >= 0 ||
+                  response.indexOf("\"status\":\"OK\"") >= 0 || response.indexOf("\"status\": \"OK\"") >= 0;
+
+  osEndpointReachable = httpOk && statusOk;
+  return osEndpointReachable;
 }
 
 void beginWifiConnection(const String& ssid, const String& pass) {
@@ -791,6 +837,60 @@ void handleLogout() {
   sendRedirect("/login");
 }
 
+bool requestOsGracefulShutdown() {
+  if (!isMainboardSignalPresent() || osIpAddress.length() == 0 || !isOsIpAddressFresh()) {
+    return false;
+  }
+
+  WiFiClient client;
+  if (!client.connect(osIpAddress.c_str(), 8765)) {
+    Serial.println("[POWER] Graceful shutdown request failed: OS not reachable on port 8765");
+    return false;
+  }
+
+  String payload = "{\"action\":\"poweroff\"}";
+  String request = "POST /powermgt HTTP/1.1\r\n";
+  request += "Host: " + osIpAddress + ":8765\r\n";
+  request += "Connection: close\r\n";
+  request += "Content-Type: application/json\r\n";
+  request += "Content-Length: " + String(payload.length()) + "\r\n\r\n";
+  request += payload;
+
+  client.print(request);
+
+  unsigned long start = millis();
+  String response;
+  response.reserve(256);
+  while (millis() - start < 2000) {
+    while (client.available()) {
+      response += static_cast<char>(client.read());
+      if (response.length() >= 512) {
+        break;
+      }
+    }
+    if (response.length() > 0) {
+      break;
+    }
+    delay(10);
+  }
+
+  client.stop();
+
+  bool httpOk = response.indexOf("HTTP/1.1 200") >= 0 || response.indexOf("HTTP/1.1 202") >= 0 ||
+                response.indexOf("HTTP/1.0 200") >= 0 || response.indexOf("HTTP/1.0 202") >= 0;
+  bool bodyOk = response.indexOf("\"success\":true") >= 0 || response.indexOf("\"status\":\"ok\"") >= 0 ||
+                response.indexOf("\"status\": \"ok\"") >= 0 || response.indexOf("\"action\":\"poweroff\"") >= 0;
+
+  if (httpOk && (bodyOk || response.indexOf("poweroff") >= 0)) {
+    Serial.println("[POWER] Graceful OS shutdown request accepted");
+    return true;
+  }
+
+  Serial.print("[POWER] Graceful shutdown rejected by OS: ");
+  Serial.println(response.substring(0, min((unsigned int)160, response.length())));
+  return false;
+}
+
 void handlePowerToggle() {
   if (!isConnectedModeWebUi()) {
     sendRedirect("/");
@@ -808,8 +908,19 @@ void handlePowerToggle() {
   }
 
   String action = webServer.hasArg("action") ? webServer.arg("action") : String("toggle");
-  if (action != "on" && action != "off" && action != "toggle") {
+  if (action != "on" && action != "off" && action != "toggle" && action != "force-off") {
     connectedUiNotice = "Invalid power action.";
+    sendRedirect("/");
+    return;
+  }
+
+  if (action == "force-off") {
+    if (powerEnabled) {
+      disablePowerDrive();
+      connectedUiNotice = "Power output forced off.";
+    } else {
+      connectedUiNotice = "Power output is already disabled.";
+    }
     sendRedirect("/");
     return;
   }
@@ -836,11 +947,16 @@ void handlePowerToggle() {
       connectedUiNotice = "Power output is already enabled.";
     }
   } else {
-    if (powerEnabled) {
-      disablePowerDrive();
-      connectedUiNotice = "Power output disabled.";
-    } else {
+    if (!powerEnabled) {
       connectedUiNotice = "Power output is already disabled.";
+      sendRedirect("/");
+      return;
+    }
+
+    if (requestOsGracefulShutdown()) {
+      connectedUiNotice = "Shutdown requested to OS.";
+    } else {
+      connectedUiNotice = "OS shutdown request failed. Hold for 5s to force power off.";
     }
   }
 
@@ -872,11 +988,28 @@ void handleConnectedStatus() {
   String bluetoothStatus = "Coming soon";
   String apiStatus = apiKey.length() > 0 ? "Key configured" : "No key set";
   String ledStatus = powerEnabled ? "Booting" : "Standby";
-  if (ledActiveCustom != LED_ACTIVE_NONE) {
+  if (ledActiveManualPreset == LedManualPreset::Normal) {
+    ledStatus = "Normal";
+  } else if (ledActiveManualPreset == LedManualPreset::ShuttingDown) {
+    ledStatus = "ShuttingDown";
+  } else if (ledActiveCustom != LED_ACTIVE_NONE) {
     ledStatus = "Custom: " + ledCustomNames[ledActiveCustom];
   }
   String ledBootColor = colorToHex(ledColorBooting);
   String ledStandbyColor = colorToHex(ledColorStandby);
+  String ledNormalColor = colorToHex(ledColorNormal);
+  String ledShuttingDownColor = colorToHex(ledColorShuttingDown);
+  bool isBoardOn = isMainboardSignalPresent();
+  bool osConnected = false;
+  String osStatusText = "Offline";
+  if (!isBoardOn) {
+    osStatusText = "Powered off";
+  } else if (osIpAddress.length() > 0 && isOsIpAddressFresh()) {
+    osConnected = refreshOsEndpointReachability();
+    osStatusText = osConnected ? "Connected" : "Unavailable";
+  } else {
+    osStatusText = "No OS IP";
+  }
 
   String json = "{";
   json += "\"mainBoardSignal\":";
@@ -891,19 +1024,34 @@ void handleConnectedStatus() {
   json += ",\"wifiStatus\":\"" + jsonEscape(wifiStatus) + "\"";
   json += ",\"bluetoothStatus\":\"" + jsonEscape(bluetoothStatus) + "\"";
   json += ",\"apiStatus\":\"" + jsonEscape(apiStatus) + "\"";
-  json += ",\"osApiReachable\":";
-  json += osApiReachable ? "true" : "false";
-  json += ",\"osApiText\":\"" + jsonEscape(osApiStatusText()) + "\"";
-  json += ",\"osApiIp\":\"" + jsonEscape(osIpAddress) + "\"";
+  json += ",\"osConnected\":" + String(osConnected ? "true" : "false");
+  json += ",\"osIpAddress\":\"" + jsonEscape(osIpAddress.length() > 0 && isOsIpAddressFresh() ? osIpAddress : "") + "\"";
+  json += ",\"osStatusText\":\"" + jsonEscape(osStatusText) + "\"";
   json += ",\"ledStatus\":\"" + jsonEscape(ledStatus) + "\"";
   json += ",\"ledBootColor\":\"" + ledBootColor + "\"";
   json += ",\"ledStandbyColor\":\"" + ledStandbyColor + "\"";
+  json += ",\"ledNormalColor\":\"" + ledNormalColor + "\"";
+  json += ",\"ledShuttingDownColor\":\"" + ledShuttingDownColor + "\"";
   json += ",\"ledBootIntensityPct\":" + String(ledBootingIntensityPct);
   json += ",\"ledStandbyIntensityPct\":" + String(ledStandbyIntensityPct);
+  json += ",\"ledNormalIntensityPct\":" + String(ledNormalIntensityPct);
+  json += ",\"ledShuttingDownIntensityPct\":" + String(ledShuttingDownIntensityPct);
   json += ",\"ledBootBreathingEnabled\":";
   json += ledBootingBreathingEnabled ? "true" : "false";
+  json += ",\"ledBootAllowedOff\":";
+  json += ledBootingAllowedOff ? "true" : "false";
   json += ",\"ledStandbyBreathingEnabled\":";
   json += ledStandbyBreathingEnabled ? "true" : "false";
+  json += ",\"ledStandbyAllowedOff\":";
+  json += ledStandbyAllowedOff ? "true" : "false";
+  json += ",\"ledNormalBreathingEnabled\":";
+  json += ledNormalBreathingEnabled ? "true" : "false";
+  json += ",\"ledNormalAllowedOff\":";
+  json += ledNormalAllowedOff ? "true" : "false";
+  json += ",\"ledShuttingDownBreathingEnabled\":";
+  json += ledShuttingDownBreathingEnabled ? "true" : "false";
+  json += ",\"ledShuttingDownAllowedOff\":";
+  json += ledShuttingDownAllowedOff ? "true" : "false";
   json += ",\"fwPartition\":\"" + jsonEscape(otaRunningPartition) + "\"";
   json += ",\"fwMd5\":\"" + ESP.getSketchMD5() + "\"";
   json += ",\"otaPending\":";
@@ -1008,18 +1156,20 @@ void handleApiSetOsAddress() {
   }
 
   osIpAddress = parsed.toString();
+  osIpAddressUpdatedAt = millis();
   preferences.putString(WIFI_PREF_KEY_OS_IP, osIpAddress);
-  osApiReachable = false;
-  osApiLastProbeAt = 0; // Force a fresh probe against the new address.
+  preferences.putULong(WIFI_PREF_KEY_OS_IP_TS, osIpAddressUpdatedAt);
+  osEndpointReachable = false;
+  osEndpointLastCheckedAt = 0; // Force a fresh reachability check against the new address.
 
   sendApiJson(200, "{\"success\":true,\"osAddress\":\"" + osIpAddress + "\"}");
 }
 
 // GET  /setLED                      -> list states (built-in + custom)
-// POST /setLED?preset=booting|standby [&color&intensity&breathing] -> edit built-in
+// POST /setLED?preset=booting|standby|normal|shuttingdown [&color&intensity&breathing] -> edit built-in
 // POST /setLED?name=<custom> [&color&intensity&breathing&allowoff]  -> create/edit custom
-// POST /setLED?activate=<name>      -> activate a state (custom or booting/standby)
-// POST /setLED?clear=1              -> deactivate custom, return to automatic
+// POST /setLED?activate=<name>      -> activate a state (custom, booting, standby, normal, or shuttingdown)
+// POST /setLED?clear=1              -> deactivate custom/manual state, return to automatic
 void handleApiSetLed() {
   if (!hasValidApiKey()) {
     sendApiUnauthorized();
@@ -1027,15 +1177,23 @@ void handleApiSetLed() {
   }
 
   if (webServer.method() == HTTP_GET) {
+    String activePreset = "none";
+    if (ledActiveManualPreset == LedManualPreset::Normal) {
+      activePreset = "normal";
+    } else if (ledActiveManualPreset == LedManualPreset::ShuttingDown) {
+      activePreset = "shuttingdown";
+    }
     String json = "{\"success\":true,\"activeCustom\":";
     if (ledActiveCustom == LED_ACTIVE_NONE) {
       json += "null";
     } else {
       json += "\"" + jsonEscape(ledCustomNames[ledActiveCustom]) + "\"";
     }
-    json += ",\"states\":[";
-    json += "{\"name\":\"booting\",\"builtin\":true,\"color\":\"" + colorToHex(ledColorBooting) + "\",\"intensity\":" + String(ledBootingIntensityPct) + ",\"breathing\":" + (ledBootingBreathingEnabled ? "true" : "false") + ",\"allowedOff\":false}";
-    json += ",{\"name\":\"standby\",\"builtin\":true,\"color\":\"" + colorToHex(ledColorStandby) + "\",\"intensity\":" + String(ledStandbyIntensityPct) + ",\"breathing\":" + (ledStandbyBreathingEnabled ? "true" : "false") + ",\"allowedOff\":true}";
+    json += ",\"activePreset\":\"" + activePreset + "\",\"states\":[";
+    json += "{\"name\":\"booting\",\"builtin\":true,\"color\":\"" + colorToHex(ledColorBooting) + "\",\"intensity\":" + String(ledBootingIntensityPct) + ",\"breathing\":" + (ledBootingBreathingEnabled ? "true" : "false") + ",\"allowedOff\":" + (ledBootingAllowedOff ? "true" : "false") + "}";
+    json += ",{\"name\":\"standby\",\"builtin\":true,\"color\":\"" + colorToHex(ledColorStandby) + "\",\"intensity\":" + String(ledStandbyIntensityPct) + ",\"breathing\":" + (ledStandbyBreathingEnabled ? "true" : "false") + ",\"allowedOff\":" + (ledStandbyAllowedOff ? "true" : "false") + "}";
+    json += ",{\"name\":\"normal\",\"builtin\":true,\"color\":\"" + colorToHex(ledColorNormal) + "\",\"intensity\":" + String(ledNormalIntensityPct) + ",\"breathing\":" + (ledNormalBreathingEnabled ? "true" : "false") + ",\"allowedOff\":" + (ledNormalAllowedOff ? "true" : "false") + "}";
+    json += ",{\"name\":\"shuttingdown\",\"builtin\":true,\"color\":\"" + colorToHex(ledColorShuttingDown) + "\",\"intensity\":" + String(ledShuttingDownIntensityPct) + ",\"breathing\":" + (ledShuttingDownBreathingEnabled ? "true" : "false") + ",\"allowedOff\":" + (ledShuttingDownAllowedOff ? "true" : "false") + "}";
     for (uint8_t i = 0; i < ledCustomCount; ++i) {
       json += ",{\"name\":\"" + jsonEscape(ledCustomNames[i]) + "\",\"builtin\":false,\"color\":\"" + colorToHex(ledCustomColors[i]) + "\",\"intensity\":" + String(ledCustomIntensities[i]) + ",\"breathing\":" + (ledCustomBreathings[i] ? "true" : "false") + ",\"allowedOff\":" + (ledCustomAllowedOff[i] ? "true" : "false") + "}";
     }
@@ -1046,7 +1204,8 @@ void handleApiSetLed() {
 
   if (webServer.hasArg("clear")) {
     ledActiveCustom = LED_ACTIVE_NONE;
-    sendApiJson(200, "{\"success\":true,\"activeCustom\":null}");
+    ledActiveManualPreset = LedManualPreset::None;
+    sendApiJson(200, "{\"success\":true,\"activeCustom\":null,\"activePreset\":\"none\"}");
     return;
   }
 
@@ -1054,7 +1213,20 @@ void handleApiSetLed() {
     String name = webServer.arg("activate");
     if (name == "booting" || name == "standby") {
       ledActiveCustom = LED_ACTIVE_NONE;
-      sendApiJson(200, "{\"success\":true,\"activeCustom\":null}");
+      ledActiveManualPreset = LedManualPreset::None;
+      sendApiJson(200, "{\"success\":true,\"activeCustom\":null,\"activePreset\":\"none\"}");
+      return;
+    }
+    if (name == "normal") {
+      ledActiveCustom = LED_ACTIVE_NONE;
+      ledActiveManualPreset = LedManualPreset::Normal;
+      sendApiJson(200, "{\"success\":true,\"activeCustom\":null,\"activePreset\":\"normal\"}");
+      return;
+    }
+    if (name == "shuttingdown") {
+      ledActiveCustom = LED_ACTIVE_NONE;
+      ledActiveManualPreset = LedManualPreset::ShuttingDown;
+      sendApiJson(200, "{\"success\":true,\"activeCustom\":null,\"activePreset\":\"shuttingdown\"}");
       return;
     }
     int idx = findCustomStateIndex(name);
@@ -1063,15 +1235,16 @@ void handleApiSetLed() {
       return;
     }
     ledActiveCustom = static_cast<uint8_t>(idx);
-    sendApiJson(200, "{\"success\":true,\"activeCustom\":\"" + jsonEscape(ledCustomNames[idx]) + "\"}");
+    ledActiveManualPreset = LedManualPreset::None;
+    sendApiJson(200, "{\"success\":true,\"activeCustom\":\"" + jsonEscape(ledCustomNames[idx]) + "\",\"activePreset\":\"none\"}");
     return;
   }
 
-  // Edit built-in preset (booting/standby).
+  // Edit built-in preset (booting/standby/normal/shuttingdown).
   if (webServer.hasArg("preset")) {
     String preset = webServer.arg("preset");
-    if (preset != "booting" && preset != "standby") {
-      sendApiJson(400, "{\"success\":false,\"error\":\"preset must be booting or standby (use name= for custom states)\"}");
+    if (preset != "booting" && preset != "standby" && preset != "normal" && preset != "shuttingdown") {
+      sendApiJson(400, "{\"success\":false,\"error\":\"preset must be booting, standby, normal or shuttingdown (use name= for custom states)\"}");
       return;
     }
 
@@ -1081,7 +1254,8 @@ void handleApiSetLed() {
     const char* intensityKey = WIFI_PREF_KEY_LED_BOOT_INTENSITY;
     bool* breathing = &ledBootingBreathingEnabled;
     const char* breathingKey = WIFI_PREF_KEY_LED_BOOT_BREATH;
-    bool allowedOff = false;
+    bool* allowedOff = &ledBootingAllowedOff;
+    const char* allowedOffKey = WIFI_PREF_KEY_LED_BOOT_ALLOW_OFF;
 
     if (preset == "standby") {
       color = &ledColorStandby;
@@ -1090,7 +1264,26 @@ void handleApiSetLed() {
       intensityKey = WIFI_PREF_KEY_LED_NORMAL_INTENSITY;
       breathing = &ledStandbyBreathingEnabled;
       breathingKey = WIFI_PREF_KEY_LED_NORMAL_BREATH;
-      allowedOff = true;
+      allowedOff = &ledStandbyAllowedOff;
+      allowedOffKey = WIFI_PREF_KEY_LED_STANDBY_ALLOW_OFF;
+    } else if (preset == "normal") {
+      color = &ledColorNormal;
+      colorKey = WIFI_PREF_KEY_LED_NORMAL;
+      intensity = &ledNormalIntensityPct;
+      intensityKey = WIFI_PREF_KEY_LED_NORMAL_INTENSITY;
+      breathing = &ledNormalBreathingEnabled;
+      breathingKey = WIFI_PREF_KEY_LED_NORMAL_BREATH;
+      allowedOff = &ledNormalAllowedOff;
+      allowedOffKey = WIFI_PREF_KEY_LED_NORMAL_ALLOW_OFF;
+    } else if (preset == "shuttingdown") {
+      color = &ledColorShuttingDown;
+      colorKey = WIFI_PREF_KEY_LED_SHUTDOWN;
+      intensity = &ledShuttingDownIntensityPct;
+      intensityKey = WIFI_PREF_KEY_LED_SHUTDOWN_INTENSITY;
+      breathing = &ledShuttingDownBreathingEnabled;
+      breathingKey = WIFI_PREF_KEY_LED_SHUTDOWN_BREATH;
+      allowedOff = &ledShuttingDownAllowedOff;
+      allowedOffKey = WIFI_PREF_KEY_LED_SHUTDOWN_ALLOW_OFF;
     }
 
     bool hadAnyUpdate = false;
@@ -1123,6 +1316,20 @@ void handleApiSetLed() {
       preferences.putBool(breathingKey, *breathing);
       hadAnyUpdate = true;
     }
+    if (webServer.hasArg("allowoff")) {
+      String value = webServer.arg("allowoff");
+      value.toLowerCase();
+      if (value == "1" || value == "true" || value == "on") {
+        *allowedOff = true;
+      } else if (value == "0" || value == "false" || value == "off") {
+        *allowedOff = false;
+      } else {
+        sendApiJson(400, "{\"success\":false,\"error\":\"invalid allowoff value (true|false)\"}");
+        return;
+      }
+      preferences.putBool(allowedOffKey, *allowedOff);
+      hadAnyUpdate = true;
+    }
     if (!hadAnyUpdate) {
       sendApiJson(400, "{\"success\":false,\"error\":\"nothing to update, pass color, intensity and/or breathing\"}");
       return;
@@ -1134,7 +1341,7 @@ void handleApiSetLed() {
     json += ",\"breathing\":";
     json += *breathing ? "true" : "false";
     json += ",\"allowedOff\":";
-    json += allowedOff ? "true" : "false";
+    json += *allowedOff ? "true" : "false";
     json += "}";
     sendApiJson(200, json);
     return;
@@ -1148,7 +1355,7 @@ void handleApiSetLed() {
       sendApiJson(400, "{\"success\":false,\"error\":\"name must be 1-16 chars\"}");
       return;
     }
-    if (name == "booting" || name == "standby") {
+    if (name == "booting" || name == "standby" || name == "normal" || name == "shuttingdown") {
       sendApiJson(400, "{\"success\":false,\"error\":\"name reserved, use preset= for built-in states\"}");
       return;
     }
@@ -1235,9 +1442,10 @@ void handleLedColorUpdate() {
   uint8_t parsedIntensity = clampLedIntensity(requestedIntensity);
   bool hasBreathingControl = webServer.hasArg("breathing_present");
   bool parsedBreathing = webServer.hasArg("breathing_enabled");
+  bool parsedAllowOff = webServer.hasArg("allowoff");
   bool hadAnyUpdate = false;
 
-  if (behavior != "booting" && behavior != "standby") {
+  if (behavior != "booting" && behavior != "standby" && behavior != "normal" && behavior != "shuttingdown") {
     connectedUiNotice = "Unknown LED behavior.";
     sendRedirect("/");
     return;
@@ -1257,6 +1465,33 @@ void handleLedColorUpdate() {
     intensityKey = WIFI_PREF_KEY_LED_NORMAL_INTENSITY;
     breathing = &ledStandbyBreathingEnabled;
     breathingKey = WIFI_PREF_KEY_LED_NORMAL_BREATH;
+  } else if (behavior == "normal") {
+    color = &ledColorNormal;
+    colorKey = WIFI_PREF_KEY_LED_NORMAL;
+    intensity = &ledNormalIntensityPct;
+    intensityKey = WIFI_PREF_KEY_LED_NORMAL_INTENSITY;
+    breathing = &ledNormalBreathingEnabled;
+    breathingKey = WIFI_PREF_KEY_LED_NORMAL_BREATH;
+  } else if (behavior == "shuttingdown") {
+    color = &ledColorShuttingDown;
+    colorKey = WIFI_PREF_KEY_LED_SHUTDOWN;
+    intensity = &ledShuttingDownIntensityPct;
+    intensityKey = WIFI_PREF_KEY_LED_SHUTDOWN_INTENSITY;
+    breathing = &ledShuttingDownBreathingEnabled;
+    breathingKey = WIFI_PREF_KEY_LED_SHUTDOWN_BREATH;
+  }
+
+  bool* allowedOff = &ledBootingAllowedOff;
+  const char* allowedOffKey = WIFI_PREF_KEY_LED_BOOT_ALLOW_OFF;
+  if (behavior == "standby") {
+    allowedOff = &ledStandbyAllowedOff;
+    allowedOffKey = WIFI_PREF_KEY_LED_STANDBY_ALLOW_OFF;
+  } else if (behavior == "normal") {
+    allowedOff = &ledNormalAllowedOff;
+    allowedOffKey = WIFI_PREF_KEY_LED_NORMAL_ALLOW_OFF;
+  } else if (behavior == "shuttingdown") {
+    allowedOff = &ledShuttingDownAllowedOff;
+    allowedOffKey = WIFI_PREF_KEY_LED_SHUTDOWN_ALLOW_OFF;
   }
 
   if (webServer.hasArg("color")) {
@@ -1278,6 +1513,8 @@ void handleLedColorUpdate() {
     *breathing = parsedBreathing;
     preferences.putBool(breathingKey, *breathing);
   }
+  *allowedOff = parsedAllowOff;
+  preferences.putBool(allowedOffKey, *allowedOff);
 
   hadAnyUpdate = true;
 
@@ -1748,6 +1985,14 @@ void handleRoot() {
     html += "<strong id='powerText'>";
     html += powerEnabled ? "ON" : "OFF";
     html += "</strong></span></div>";
+    html += "<div class='indicator-row'><span id='osIpDot' class='dot ";
+    html += isMainboardSignalPresent() && osEndpointReachable ? "dot-green" : "dot-red";
+    html += "'></span><span>OS IP: ";
+    html += "<strong id='osIpText'>";
+    if (osIpAddress.length() > 0 && isOsIpAddressFresh()) {
+      html += htmlEscape(osIpAddress);
+    }
+    html += "</strong></span></div>";
     html += "<p id='lockoutText' class='section-copy'>";
     if (lockoutActiveNow) {
       html += "Power-on lockout: " + String(lockoutRemainingSec) + "s remaining.";
@@ -1762,7 +2007,7 @@ void handleRoot() {
     }
     html += " id='powerOnBtn'";
     html += ">POWER ON</button></form>";
-    html += "<form method='POST' action='/power-toggle'><input type='hidden' name='action' value='off'><button class='btn btn-danger' type='submit'";
+    html += "<form method='POST' action='/power-toggle'><input type='hidden' name='action' value='off'><button class='btn btn-danger' type='button'";
     if (!powerEnabled) {
       html += " disabled";
     }
@@ -1778,28 +2023,46 @@ void handleRoot() {
       html += "<form class='api-key-form' method='POST' action='/api-key/generate'><button class='link-btn' type='submit'>Set new key</button></form>";
     }
     html += "</div>";
-    html += "<div class='indicator-row'><span id='osApiDot' class='dot ";
-    html += osApiReachable ? "dot-green" : "dot-red";
-    html += "'></span><span>OS API: <strong id='osApiText'>";
-    html += osApiStatusText();
-    html += "</strong></span></div>";
-    html += "<p id='osApiIpLine' class='section-copy' style='margin:4px 0 0;'>OS address: ";
-    html += osIpAddress.length() > 0 ? htmlEscape(osIpAddress) : "not set (POST /setosaddress)";
-    html += "</p>";
     html += "<span id='apiStatusTag' class='section-tag'>";
     html += apiKey.length() > 0 ? "Key configured" : "No key set";
     html += "</span></article>";
     html += "<article class='panel'><h2 class='section-title'>LED Management</h2><p class='section-copy'>Tune LED effects, brightness levels, and profile behavior by state.</p><div class='led-list'>";
-    html += "<div class='led-row'><div><div class='led-name'>Booting State</div><div class='led-preview'><span id='ledBootSwatch' class='swatch' style='background:" + colorToHex(ledColorBooting) + "'></span><span id='ledBootText'>" + colorToHex(ledColorBooting) + "</span></div></div><form class='led-form led-full' method='POST' action='/led-color'><input type='hidden' name='behavior' value='booting'><input type='hidden' name='breathing_present' value='1'><input id='ledBootColorInput' type='color' name='color' value='" + colorToHex(ledColorBooting) + "'><div class='slider-wrap'><div class='slider-label'><span>Intensity</span><span id='ledBootIntensityText' class='slider-value'>" + String(ledBootingIntensityPct) + "%</span></div><input id='ledBootIntensityInput' type='range' min='5' max='100' name='intensity' value='" + String(ledBootingIntensityPct) + "'></div><label class='check-wrap'><input id='ledBootBreathInput' type='checkbox' name='breathing_enabled' value='1'";
+    html += "<div class='led-row'><div><div class='led-name'>Booting State</div><div class='led-preview'><span id='ledBootSwatch' class='swatch' style='background:" + colorToHex(ledColorBooting) + "'></span><span id='ledBootText'>" + colorToHex(ledColorBooting) + "</span></div></div><form class='led-form led-full' method='POST' action='/led-color'><input type='hidden' name='behavior' value='booting'><input type='hidden' name='breathing_present' value='1'><input id='ledBootColorInput' type='color' name='color' value='" + colorToHex(ledColorBooting) + "'><div class='slider-wrap'><div class='slider-label'><span>Intensity</span><span id='ledBootIntensityText' class='slider-value'>" + String(ledBootingIntensityPct) + "%</span></div><input id='ledBootIntensityInput' type='range' min='5' max='100' name='intensity' value='" + String(ledBootingIntensityPct) + "'></div><div class='led-checks'><label class='check-wrap'><input id='ledBootAllowOffInput' type='checkbox' name='allowoff' value='1'";
+    if (ledBootingAllowedOff) {
+      html += " checked";
+    }
+    html += "><span>Run with power off</span></label><label class='check-wrap'><input id='ledBootBreathInput' type='checkbox' name='breathing_enabled' value='1'";
     if (ledBootingBreathingEnabled) {
       html += " checked";
     }
-    html += "><span>Effect (breathing)</span></label><button class='btn led-full' type='submit'>SAVE</button></form></div>";
-    html += "<div class='led-row'><div><div class='led-name'>Standby State (power off)</div><div class='led-preview'><span id='ledStandbySwatch' class='swatch' style='background:" + colorToHex(ledColorStandby) + "'></span><span id='ledStandbyText'>" + colorToHex(ledColorStandby) + "</span></div></div><form class='led-form led-full' method='POST' action='/led-color'><input type='hidden' name='behavior' value='standby'><input type='hidden' name='breathing_present' value='1'><input id='ledStandbyColorInput' type='color' name='color' value='" + colorToHex(ledColorStandby) + "'><div class='slider-wrap'><div class='slider-label'><span>Intensity</span><span id='ledStandbyIntensityText' class='slider-value'>" + String(ledStandbyIntensityPct) + "%</span></div><input id='ledStandbyIntensityInput' type='range' min='5' max='100' name='intensity' value='" + String(ledStandbyIntensityPct) + "'></div><label class='check-wrap'><input id='ledStandbyBreathInput' type='checkbox' name='breathing_enabled' value='1'";
+    html += "><span>Effect (breathing)</span></label></div><button class='btn led-full' type='submit'>SAVE</button></form></div>";
+    html += "<div class='led-row'><div><div class='led-name'>Standby State (power off)</div><div class='led-preview'><span id='ledStandbySwatch' class='swatch' style='background:" + colorToHex(ledColorStandby) + "'></span><span id='ledStandbyText'>" + colorToHex(ledColorStandby) + "</span></div></div><form class='led-form led-full' method='POST' action='/led-color'><input type='hidden' name='behavior' value='standby'><input type='hidden' name='breathing_present' value='1'><input id='ledStandbyColorInput' type='color' name='color' value='" + colorToHex(ledColorStandby) + "'><div class='slider-wrap'><div class='slider-label'><span>Intensity</span><span id='ledStandbyIntensityText' class='slider-value'>" + String(ledStandbyIntensityPct) + "%</span></div><input id='ledStandbyIntensityInput' type='range' min='5' max='100' name='intensity' value='" + String(ledStandbyIntensityPct) + "'></div><div class='led-checks'><label class='check-wrap'><input id='ledStandbyAllowOffInput' type='checkbox' name='allowoff' value='1'";
+    if (ledStandbyAllowedOff) {
+      html += " checked";
+    }
+    html += "><span>Run with power off</span></label><label class='check-wrap'><input id='ledStandbyBreathInput' type='checkbox' name='breathing_enabled' value='1'";
     if (ledStandbyBreathingEnabled) {
       html += " checked";
     }
-    html += "><span>Effect (breathing)</span></label><button class='btn led-full' type='submit'>SAVE</button></form></div>";
+    html += "><span>Effect (breathing)</span></label></div><button class='btn led-full' type='submit'>SAVE</button></form></div>";
+    html += "<div class='led-row'><div><div class='led-name'>Normal State</div><div class='led-preview'><span id='ledNormalSwatch' class='swatch' style='background:" + colorToHex(ledColorNormal) + "'></span><span id='ledNormalText'>" + colorToHex(ledColorNormal) + "</span></div></div><form class='led-form led-full' method='POST' action='/led-color'><input type='hidden' name='behavior' value='normal'><input type='hidden' name='breathing_present' value='1'><input id='ledNormalColorInput' type='color' name='color' value='" + colorToHex(ledColorNormal) + "'><div class='slider-wrap'><div class='slider-label'><span>Intensity</span><span id='ledNormalIntensityText' class='slider-value'>" + String(ledNormalIntensityPct) + "%</span></div><input id='ledNormalIntensityInput' type='range' min='5' max='100' name='intensity' value='" + String(ledNormalIntensityPct) + "'></div><div class='led-checks'><label class='check-wrap'><input id='ledNormalAllowOffInput' type='checkbox' name='allowoff' value='1'";
+    if (ledNormalAllowedOff) {
+      html += " checked";
+    }
+    html += "><span>Run with power off</span></label><label class='check-wrap'><input id='ledNormalBreathInput' type='checkbox' name='breathing_enabled' value='1'";
+    if (ledNormalBreathingEnabled) {
+      html += " checked";
+    }
+    html += "><span>Effect (breathing)</span></label></div><button class='btn led-full' type='submit'>SAVE</button></form></div>";
+    html += "<div class='led-row'><div><div class='led-name'>Shutting Down State</div><div class='led-preview'><span id='ledShuttingDownSwatch' class='swatch' style='background:" + colorToHex(ledColorShuttingDown) + "'></span><span id='ledShuttingDownText'>" + colorToHex(ledColorShuttingDown) + "</span></div></div><form class='led-form led-full' method='POST' action='/led-color'><input type='hidden' name='behavior' value='shuttingdown'><input type='hidden' name='breathing_present' value='1'><input id='ledShuttingDownColorInput' type='color' name='color' value='" + colorToHex(ledColorShuttingDown) + "'><div class='slider-wrap'><div class='slider-label'><span>Intensity</span><span id='ledShuttingDownIntensityText' class='slider-value'>" + String(ledShuttingDownIntensityPct) + "%</span></div><input id='ledShuttingDownIntensityInput' type='range' min='5' max='100' name='intensity' value='" + String(ledShuttingDownIntensityPct) + "'></div><div class='led-checks'><label class='check-wrap'><input id='ledShuttingDownAllowOffInput' type='checkbox' name='allowoff' value='1'";
+    if (ledShuttingDownAllowedOff) {
+      html += " checked";
+    }
+    html += "><span>Run with power off</span></label><label class='check-wrap'><input id='ledShuttingDownBreathInput' type='checkbox' name='breathing_enabled' value='1'";
+    if (ledShuttingDownBreathingEnabled) {
+      html += " checked";
+    }
+    html += "><span>Effect (breathing)</span></label></div><button class='btn led-full' type='submit'>SAVE</button></form></div>";
     html += "</div>";
 
     // Custom states.
@@ -1872,44 +2135,58 @@ void handleRoot() {
     html += "function syncConnectedStatus(d){";
     html += "var mbDot=document.getElementById('mbSignalDot');var mbText=document.getElementById('mbSignalText');";
     html += "var pDot=document.getElementById('powerDot');var pText=document.getElementById('powerText');";
+    html += "var osDot=document.getElementById('osIpDot');var osText=document.getElementById('osIpText');";
     html += "var lock=document.getElementById('lockoutText');var onBtn=document.getElementById('powerOnBtn');var offBtn=document.getElementById('powerOffBtn');";
     html += "var wifi=document.getElementById('wifiStatusLine');var bt=document.getElementById('bluetoothStatusTag');var api=document.getElementById('apiStatusTag');";
-    html += "var osDot=document.getElementById('osApiDot');var osText=document.getElementById('osApiText');var osIp=document.getElementById('osApiIpLine');";
     html += "var fwLine=document.getElementById('fwPartitionLine');var pend=document.getElementById('otaPendingLine');";
-    html += "var bIn=document.getElementById('ledBootColorInput');var nIn=document.getElementById('ledStandbyColorInput');";
-    html += "var bi=document.getElementById('ledBootIntensityInput');var ni=document.getElementById('ledStandbyIntensityInput');";
-    html += "var bt=document.getElementById('ledBootIntensityText');var nt=document.getElementById('ledStandbyIntensityText');";
-    html += "var bb=document.getElementById('ledBootBreathInput');var nb=document.getElementById('ledStandbyBreathInput');";
+    html += "var bIn=document.getElementById('ledBootColorInput');var nIn=document.getElementById('ledStandbyColorInput');var mIn=document.getElementById('ledNormalColorInput');var sIn=document.getElementById('ledShuttingDownColorInput');";
+    html += "var bi=document.getElementById('ledBootIntensityInput');var ni=document.getElementById('ledStandbyIntensityInput');var mi=document.getElementById('ledNormalIntensityInput');var si=document.getElementById('ledShuttingDownIntensityInput');";
+    html += "var bt=document.getElementById('ledBootIntensityText');var nt=document.getElementById('ledStandbyIntensityText');var mt=document.getElementById('ledNormalIntensityText');var st=document.getElementById('ledShuttingDownIntensityText');";
+    html += "var bb=document.getElementById('ledBootBreathInput');var nb=document.getElementById('ledStandbyBreathInput');var mb=document.getElementById('ledNormalBreathInput');var sb=document.getElementById('ledShuttingDownBreathInput');";
+    html += "var ba=document.getElementById('ledBootAllowOffInput');var na=document.getElementById('ledStandbyAllowOffInput');var ma=document.getElementById('ledNormalAllowOffInput');var sa=document.getElementById('ledShuttingDownAllowOffInput');";
     html += "setDot(mbDot,!!d.mainBoardSignal);if(mbText){mbText.textContent=d.mainBoardSignalText||'Unknown';}";
     html += "setDot(pDot,!!d.powerEnabled);if(pText){pText.textContent=d.powerText||'Unknown';}";
+    html += "var osConnected=!!d.osConnected;setDot(osDot,osConnected);if(osText){osText.textContent=d.osIpAddress||'';}";
     html += "if(lock){if(d.lockoutActive){lock.textContent='Power-on lockout: '+String(d.lockoutRemainingSec||0)+'s remaining.';}else{lock.textContent='';}}";
     html += "if(onBtn){onBtn.disabled=!!d.powerEnabled||!!d.lockoutActive;}";
     html += "if(offBtn){offBtn.disabled=!d.powerEnabled;}";
     html += "if(wifi){wifi.textContent=d.wifiStatus||'';}";
     html += "if(bt){bt.textContent=d.bluetoothStatus||'Coming soon';}";
     html += "if(api){api.textContent=d.apiStatus||'No key set';}";
-    html += "setDot(osDot,!!d.osApiReachable);if(osText){osText.textContent=d.osApiText||'Unreachable';}";
-    html += "if(osIp){osIp.textContent=d.osApiIp?('OS address: '+d.osApiIp):'OS address: not set (POST /setosaddress)';}";
     html += "if(fwLine){fwLine.textContent='Running: '+(d.fwPartition||'?')+' - MD5 '+String(d.fwMd5||'').substring(0,8);}";
     html += "if(pend){if(d.otaPending){pend.style.display='';pend.innerHTML='<strong>New firmware is pending validation.</strong> It confirms automatically once the network is up; if the board stays unreachable it rolls back and restarts.';}else{pend.style.display='none';}}";
-    html += "setSwatch('ledBootSwatch',d.ledBootColor);setSwatch('ledStandbySwatch',d.ledStandbyColor);";
-    html += "setText('ledBootText',d.ledBootColor||'');setText('ledStandbyText',d.ledStandbyColor||'');";
+    html += "setSwatch('ledBootSwatch',d.ledBootColor);setSwatch('ledStandbySwatch',d.ledStandbyColor);setSwatch('ledNormalSwatch',d.ledNormalColor);setSwatch('ledShuttingDownSwatch',d.ledShuttingDownColor);";
+    html += "setText('ledBootText',d.ledBootColor||'');setText('ledStandbyText',d.ledStandbyColor||'');setText('ledNormalText',d.ledNormalColor||'');setText('ledShuttingDownText',d.ledShuttingDownColor||'');";
     html += "if(bIn&&d.ledBootColor&&document.activeElement!==bIn){bIn.value=d.ledBootColor;}";
     html += "if(nIn&&d.ledStandbyColor&&document.activeElement!==nIn){nIn.value=d.ledStandbyColor;}";
+    html += "if(mIn&&d.ledNormalColor&&document.activeElement!==mIn){mIn.value=d.ledNormalColor;}";
+    html += "if(sIn&&d.ledShuttingDownColor&&document.activeElement!==sIn){sIn.value=d.ledShuttingDownColor;}";
     html += "if(bt&&typeof d.ledBootIntensityPct==='number'){bt.textContent=String(d.ledBootIntensityPct)+'%';}";
     html += "if(nt&&typeof d.ledStandbyIntensityPct==='number'){nt.textContent=String(d.ledStandbyIntensityPct)+'%';}";
+    html += "if(mt&&typeof d.ledNormalIntensityPct==='number'){mt.textContent=String(d.ledNormalIntensityPct)+'%';}";
+    html += "if(st&&typeof d.ledShuttingDownIntensityPct==='number'){st.textContent=String(d.ledShuttingDownIntensityPct)+'%';}";
     html += "if(bi&&typeof d.ledBootIntensityPct==='number'&&document.activeElement!==bi){bi.value=String(d.ledBootIntensityPct);}";
     html += "if(ni&&typeof d.ledStandbyIntensityPct==='number'&&document.activeElement!==ni){ni.value=String(d.ledStandbyIntensityPct);}";
+    html += "if(mi&&typeof d.ledNormalIntensityPct==='number'&&document.activeElement!==mi){mi.value=String(d.ledNormalIntensityPct);}";
+    html += "if(si&&typeof d.ledShuttingDownIntensityPct==='number'&&document.activeElement!==si){si.value=String(d.ledShuttingDownIntensityPct);}";
     html += "if(bb&&typeof d.ledBootBreathingEnabled==='boolean'&&document.activeElement!==bb){bb.checked=!!d.ledBootBreathingEnabled;}";
+    html += "if(ba&&typeof d.ledBootAllowedOff==='boolean'&&document.activeElement!==ba){ba.checked=!!d.ledBootAllowedOff;}";
     html += "if(nb&&typeof d.ledStandbyBreathingEnabled==='boolean'&&document.activeElement!==nb){nb.checked=!!d.ledStandbyBreathingEnabled;}";
+    html += "if(na&&typeof d.ledStandbyAllowedOff==='boolean'&&document.activeElement!==na){na.checked=!!d.ledStandbyAllowedOff;}";
+    html += "if(mb&&typeof d.ledNormalBreathingEnabled==='boolean'&&document.activeElement!==mb){mb.checked=!!d.ledNormalBreathingEnabled;}";
+    html += "if(ma&&typeof d.ledNormalAllowedOff==='boolean'&&document.activeElement!==ma){ma.checked=!!d.ledNormalAllowedOff;}";
+    html += "if(sb&&typeof d.ledShuttingDownBreathingEnabled==='boolean'&&document.activeElement!==sb){sb.checked=!!d.ledShuttingDownBreathingEnabled;}";
+    html += "if(sa&&typeof d.ledShuttingDownAllowedOff==='boolean'&&document.activeElement!==sa){sa.checked=!!d.ledShuttingDownAllowedOff;}";
     html += "}";
+    html += "async function submitPowerAction(action){var body='action='+encodeURIComponent(action);try{var res=await fetch('/power-toggle',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:body,cache:'no-store'});if(!res.ok&&res.status!==302){throw new Error('HTTP '+res.status);}window.location.reload();}catch(e){window.location.reload();}}";
+    html += "(function(){var offBtn=document.getElementById('powerOffBtn');if(!offBtn){return;}var holdTimer=null;var clearHold=function(){if(holdTimer){clearTimeout(holdTimer);holdTimer=null;}};offBtn.addEventListener('click',function(e){e.preventDefault();});offBtn.addEventListener('pointerdown',function(e){e.preventDefault();if(offBtn.disabled){return;}clearHold();holdTimer=setTimeout(function(){holdTimer=null;submitPowerAction('force-off');},5000);});offBtn.addEventListener('pointerup',function(e){e.preventDefault();if(holdTimer){clearHold();submitPowerAction('off');}});offBtn.addEventListener('pointerleave',function(){if(holdTimer){clearHold();submitPowerAction('off');}});offBtn.addEventListener('pointercancel',function(){if(holdTimer){clearHold();submitPowerAction('off');}});offBtn.addEventListener('blur',function(){if(holdTimer){clearHold();submitPowerAction('off');}});})();";
     html += "async function refreshConnectedStatus(){";
     html += "try{var res=await fetch('/connected-status',{cache:'no-store'});";
     html += "if(res.status===401){window.location='/login';return;}";
     html += "if(!res.ok){throw new Error('HTTP '+res.status);}var data=await res.json();syncConnectedStatus(data);}catch(e){}";
     html += "}";
-    html += "window.addEventListener('load',function(){refreshConnectedStatus();setInterval(refreshConnectedStatus,2000);});";
-    html += "(function(){function bindSlider(sliderId,labelId){var s=document.getElementById(sliderId);var l=document.getElementById(labelId);if(s&&l){s.addEventListener('input',function(){l.textContent=String(s.value)+'%';});}}bindSlider('ledBootIntensityInput','ledBootIntensityText');bindSlider('ledStandbyIntensityInput','ledStandbyIntensityText');})();";
+    html += "window.addEventListener('load',function(){refreshConnectedStatus();});";
+    html += "(function(){function bindSlider(sliderId,labelId){var s=document.getElementById(sliderId);var l=document.getElementById(labelId);if(s&&l){s.addEventListener('input',function(){l.textContent=String(s.value)+'%';});}}bindSlider('ledBootIntensityInput','ledBootIntensityText');bindSlider('ledStandbyIntensityInput','ledStandbyIntensityText');bindSlider('ledNormalIntensityInput','ledNormalIntensityText');bindSlider('ledShuttingDownIntensityInput','ledShuttingDownIntensityText');})();";
     html += "</script>";
     html += "</main></body></html>";
     webServer.send(200, "text/html", html);
@@ -2181,8 +2458,23 @@ void setupWifiWebUi() {
     osIpAddress = "";
   }
 
+  if (preferences.isKey(WIFI_PREF_KEY_OS_IP_TS)) {
+    osIpAddressUpdatedAt = preferences.getULong(WIFI_PREF_KEY_OS_IP_TS, 0);
+  } else {
+    osIpAddressUpdatedAt = 0;
+  }
+
+  if (!isOsIpAddressFresh()) {
+    osIpAddress = "";
+    osIpAddressUpdatedAt = 0;
+    preferences.remove(WIFI_PREF_KEY_OS_IP);
+    preferences.remove(WIFI_PREF_KEY_OS_IP_TS);
+  }
+
   ledColorBooting = loadLedColorPreference(WIFI_PREF_KEY_LED_BOOT, ledColorBooting);
   ledColorStandby = loadLedColorPreference(WIFI_PREF_KEY_LED_NORMAL, ledColorStandby);
+  ledColorNormal = loadLedColorPreference(WIFI_PREF_KEY_LED_NORMAL, ledColorNormal);
+  ledColorShuttingDown = loadLedColorPreference(WIFI_PREF_KEY_LED_SHUTDOWN, ledColorShuttingDown);
   uint8_t legacyIntensity = 80;
   bool legacyBreathing = true;
   if (preferences.isKey(WIFI_PREF_KEY_LED_INTENSITY)) {
@@ -2200,9 +2492,17 @@ void setupWifiWebUi() {
   }
   if (preferences.isKey(WIFI_PREF_KEY_LED_NORMAL_INTENSITY)) {
     ledStandbyIntensityPct = clampLedIntensity(preferences.getUChar(WIFI_PREF_KEY_LED_NORMAL_INTENSITY, ledStandbyIntensityPct));
+    ledNormalIntensityPct = ledStandbyIntensityPct;
   } else {
     ledStandbyIntensityPct = 30;
+    ledNormalIntensityPct = 80;
     preferences.putUChar(WIFI_PREF_KEY_LED_NORMAL_INTENSITY, ledStandbyIntensityPct);
+  }
+  if (preferences.isKey(WIFI_PREF_KEY_LED_SHUTDOWN_INTENSITY)) {
+    ledShuttingDownIntensityPct = clampLedIntensity(preferences.getUChar(WIFI_PREF_KEY_LED_SHUTDOWN_INTENSITY, ledShuttingDownIntensityPct));
+  } else {
+    ledShuttingDownIntensityPct = 65;
+    preferences.putUChar(WIFI_PREF_KEY_LED_SHUTDOWN_INTENSITY, ledShuttingDownIntensityPct);
   }
 
   if (preferences.isKey(WIFI_PREF_KEY_LED_BOOT_BREATH)) {
@@ -2211,17 +2511,40 @@ void setupWifiWebUi() {
     ledBootingBreathingEnabled = legacyBreathing;
     preferences.putBool(WIFI_PREF_KEY_LED_BOOT_BREATH, ledBootingBreathingEnabled);
   }
+  if (preferences.isKey(WIFI_PREF_KEY_LED_BOOT_ALLOW_OFF)) {
+    ledBootingAllowedOff = preferences.getBool(WIFI_PREF_KEY_LED_BOOT_ALLOW_OFF, ledBootingAllowedOff);
+  } else {
+    preferences.putBool(WIFI_PREF_KEY_LED_BOOT_ALLOW_OFF, ledBootingAllowedOff);
+  }
   if (preferences.isKey(WIFI_PREF_KEY_LED_NORMAL_BREATH)) {
     ledStandbyBreathingEnabled = preferences.getBool(WIFI_PREF_KEY_LED_NORMAL_BREATH, ledStandbyBreathingEnabled);
+    ledNormalBreathingEnabled = ledStandbyBreathingEnabled;
   } else {
     ledStandbyBreathingEnabled = false;
+    ledNormalBreathingEnabled = false;
     preferences.putBool(WIFI_PREF_KEY_LED_NORMAL_BREATH, ledStandbyBreathingEnabled);
   }
-
-  // Drop legacy shutdown-state prefs.
-  preferences.remove(WIFI_PREF_KEY_LED_SHUTDOWN);
-  preferences.remove(WIFI_PREF_KEY_LED_SHUTDOWN_INTENSITY);
-  preferences.remove(WIFI_PREF_KEY_LED_SHUTDOWN_BREATH);
+  if (preferences.isKey(WIFI_PREF_KEY_LED_STANDBY_ALLOW_OFF)) {
+    ledStandbyAllowedOff = preferences.getBool(WIFI_PREF_KEY_LED_STANDBY_ALLOW_OFF, ledStandbyAllowedOff);
+  } else {
+    preferences.putBool(WIFI_PREF_KEY_LED_STANDBY_ALLOW_OFF, ledStandbyAllowedOff);
+  }
+  if (preferences.isKey(WIFI_PREF_KEY_LED_NORMAL_ALLOW_OFF)) {
+    ledNormalAllowedOff = preferences.getBool(WIFI_PREF_KEY_LED_NORMAL_ALLOW_OFF, ledNormalAllowedOff);
+  } else {
+    preferences.putBool(WIFI_PREF_KEY_LED_NORMAL_ALLOW_OFF, ledNormalAllowedOff);
+  }
+  if (preferences.isKey(WIFI_PREF_KEY_LED_SHUTDOWN_BREATH)) {
+    ledShuttingDownBreathingEnabled = preferences.getBool(WIFI_PREF_KEY_LED_SHUTDOWN_BREATH, ledShuttingDownBreathingEnabled);
+  } else {
+    ledShuttingDownBreathingEnabled = true;
+    preferences.putBool(WIFI_PREF_KEY_LED_SHUTDOWN_BREATH, ledShuttingDownBreathingEnabled);
+  }
+  if (preferences.isKey(WIFI_PREF_KEY_LED_SHUTDOWN_ALLOW_OFF)) {
+    ledShuttingDownAllowedOff = preferences.getBool(WIFI_PREF_KEY_LED_SHUTDOWN_ALLOW_OFF, ledShuttingDownAllowedOff);
+  } else {
+    preferences.putBool(WIFI_PREF_KEY_LED_SHUTDOWN_ALLOW_OFF, ledShuttingDownAllowedOff);
+  }
 
   // Load custom states.
   ledCustomCount = 0;
@@ -2291,12 +2614,24 @@ void setupWifiWebUi() {
   webServer.on("/favicon.ico", HTTP_GET, []() {
     webServer.send(204, "image/x-icon", "");
   });
+  webServer.on("/apple-touch-icon.png", HTTP_GET, []() {
+    webServer.send(204, "image/png", "");
+  });
+  webServer.on("/apple-touch-icon-precomposed.png", HTTP_GET, []() {
+    webServer.send(204, "image/png", "");
+  });
   registerCaptivePortalRoutes();
   webServer.onNotFound([]() {
+    String uri = webServer.uri();
+    if (uri == "/apple-touch-icon.png" || uri == "/apple-touch-icon-precomposed.png") {
+      webServer.send(204, "image/png", "");
+      return;
+    }
+
     Serial.print("[WEB] No handler for ");
     Serial.print(webServer.method() == HTTP_GET ? "GET" : (webServer.method() == HTTP_POST ? "POST" : "OTHER"));
     Serial.print(" ");
-    Serial.println(webServer.uri());
+    Serial.println(uri);
 
     if (wifiFallbackApEnabled) {
       webServer.sendHeader("Location", "/", true);
@@ -2364,17 +2699,28 @@ void updateWifiState() {
 Adafruit_NeoPixel argb(ARGB_LED_COUNT, PIN_ARGB_DATA, NEO_GRB + NEO_KHZ800);
 
 // Automatic states only: Booting (power ON) and Standby (power OFF).
+// Manual presets are activated via API and render instead when selected.
 // Custom states are activated by API and render instead when allowed.
 enum class ArgbState {
   Standby,
   Booting,
   Custom,
+  Normal,
+  ShuttingDown,
 };
 
 ArgbState argbState = ArgbState::Standby;
 ArgbState lastReportedArgbState = ArgbState::Standby;
 
 void resolveArgbState() {
+  if (ledActiveManualPreset == LedManualPreset::Normal) {
+    argbState = ArgbState::Normal;
+    return;
+  }
+  if (ledActiveManualPreset == LedManualPreset::ShuttingDown) {
+    argbState = ArgbState::ShuttingDown;
+    return;
+  }
   if (ledActiveCustom != LED_ACTIVE_NONE) {
     if (powerEnabled || ledCustomAllowedOff[ledActiveCustom]) {
       argbState = ArgbState::Custom;
@@ -2415,6 +2761,10 @@ void reportArgbStateIfChanged() {
     Serial.println("[ARGB] STANDBY");
   } else if (argbState == ArgbState::Booting) {
     Serial.println("[ARGB] BOOTING");
+  } else if (argbState == ArgbState::Normal) {
+    Serial.println("[ARGB] NORMAL");
+  } else if (argbState == ArgbState::ShuttingDown) {
+    Serial.println("[ARGB] SHUTTING_DOWN");
   } else if (argbState == ArgbState::Custom) {
     Serial.print("[ARGB] CUSTOM ");
     Serial.println(ledCustomNames[ledActiveCustom]);
@@ -2434,6 +2784,26 @@ void renderArgb() {
       scaleChannelByPercent(ledColorBooting.r, pct),
       scaleChannelByPercent(ledColorBooting.g, pct),
       scaleChannelByPercent(ledColorBooting.b, pct)
+    );
+    return;
+  }
+
+  if (argbState == ArgbState::Normal) {
+    uint8_t pct = ledNormalBreathingEnabled ? breathingPercent(millis(), ledNormalIntensityPct) : ledNormalIntensityPct;
+    setAllArgb(
+      scaleChannelByPercent(ledColorNormal.r, pct),
+      scaleChannelByPercent(ledColorNormal.g, pct),
+      scaleChannelByPercent(ledColorNormal.b, pct)
+    );
+    return;
+  }
+
+  if (argbState == ArgbState::ShuttingDown) {
+    uint8_t pct = ledShuttingDownBreathingEnabled ? breathingPercent(millis(), ledShuttingDownIntensityPct) : ledShuttingDownIntensityPct;
+    setAllArgb(
+      scaleChannelByPercent(ledColorShuttingDown.r, pct),
+      scaleChannelByPercent(ledColorShuttingDown.g, pct),
+      scaleChannelByPercent(ledColorShuttingDown.b, pct)
     );
     return;
   }
@@ -2505,6 +2875,8 @@ bool isButtonHeldPressed() {
 void enablePowerDrive() {
   powerEnabled = true;
   powerEnabledAt = millis();
+  ledActiveCustom = LED_ACTIVE_NONE;
+  ledActiveManualPreset = LedManualPreset::None;
   argbState = ArgbState::Booting;
   signalLossTimerRunning = false;
   offHoldTimerRunning = false;
@@ -2523,6 +2895,8 @@ void disablePowerDrive() {
   signalLossTimerRunning = false;
   offHoldTimerRunning = false;
   offHoldLastProgressSecond = 0;
+  ledActiveCustom = LED_ACTIVE_NONE;
+  ledActiveManualPreset = LedManualPreset::None;
   argbState = ArgbState::Standby;
   digitalWrite(PIN_TRANSISTOR_DRIVE, LOW);
   Serial.println("[POWER] GPIO25 OFF");
@@ -2603,6 +2977,23 @@ void loop() {
 
   // 2) If power drive is active, monitor motherboard status signal on GPIO34
   if (powerEnabled) {
+    if (consumeButtonPressedEdge()) {
+      offButtonPressTracking = true;
+      offButtonPressedAt = millis();
+      offButtonLongHoldHandled = false;
+    }
+
+    if (consumeButtonReleasedEdge() && offButtonPressTracking) {
+      unsigned long heldMs = millis() - offButtonPressedAt;
+      offButtonPressTracking = false;
+      offButtonLongHoldHandled = false;
+
+      if (heldMs < BUTTON_HOLD_TO_OFF_MS) {
+        Serial.println("[BUTTON] Short press while ON, requesting graceful OS shutdown");
+        requestOsGracefulShutdown();
+      }
+    }
+
     // 2.a) Manual power-off request via long press
     bool holdToOffArmed = (millis() - powerEnabledAt) >= BUTTON_HOLD_ARM_DELAY_MS;
     if (holdToOffArmed) {
@@ -2666,7 +3057,6 @@ void loop() {
   updateFallbackHoldIndicator();
   renderArgb();
   updateWifiState();
-  updateOsApiStatus();
   updateOtaValidation();
 
   delay(5);
